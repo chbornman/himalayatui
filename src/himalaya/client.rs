@@ -14,23 +14,39 @@ pub fn list_accounts() -> Result<Vec<Account>> {
 
 /// Get email address for an account from himalaya config
 pub fn get_account_email(account_name: Option<&str>) -> Option<String> {
-    let config_path = dirs::config_dir()?.join("himalaya/config.toml");
-    let content = std::fs::read_to_string(config_path).ok()?;
-    let config: toml::Value = content.parse().ok()?;
+    use serde::Deserialize;
+    use std::collections::HashMap;
 
-    let accounts = config.get("accounts")?.as_table()?;
+    #[derive(Deserialize)]
+    struct HimalayaConfig {
+        accounts: HashMap<String, AccountConfig>,
+    }
+
+    #[derive(Deserialize)]
+    struct AccountConfig {
+        email: Option<String>,
+        #[serde(default)]
+        default: bool,
+    }
+
+    let config_path = dirs::config_dir()?.join("himalaya/config.toml");
+    let content = std::fs::read_to_string(&config_path).ok()?;
+    let config: HimalayaConfig = toml::from_str(&content).ok()?;
 
     // If no account specified, find the default one
-    let account = if let Some(name) = account_name {
-        accounts.get(name)?
+    let email = if let Some(name) = account_name {
+        config.accounts.get(name)?.email.clone()
     } else {
-        accounts
+        config
+            .accounts
             .values()
-            .find(|a| a.get("default").and_then(|v| v.as_bool()).unwrap_or(false))
-            .or_else(|| accounts.values().next())?
+            .find(|a| a.default)
+            .or_else(|| config.accounts.values().next())?
+            .email
+            .clone()
     };
 
-    account.get("email")?.as_str().map(|s| s.to_string())
+    email
 }
 
 /// Get default account name
