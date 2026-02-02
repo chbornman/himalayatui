@@ -52,6 +52,10 @@ pub struct App {
     pub preview_urls: Vec<(u16, u16, u16, String)>,
     // Debounced read marking: (message_id, opened_at)
     pub pending_read_mark: Option<(String, Instant)>,
+    // Current account
+    pub account: Option<String>,
+    pub account_email: Option<String>,
+    pub accounts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,7 +69,13 @@ pub struct ComposeState {
 }
 
 impl App {
-    pub fn new(envelopes: Vec<Envelope>, config: Arc<Config>) -> Self {
+    pub fn new(
+        envelopes: Vec<Envelope>,
+        config: Arc<Config>,
+        account: Option<String>,
+        account_email: Option<String>,
+        accounts: Vec<String>,
+    ) -> Self {
         let mut list_state = ListState::default();
         if !envelopes.is_empty() {
             list_state.select(Some(0));
@@ -98,7 +108,25 @@ impl App {
             preview_area: Rect::default(),
             preview_urls: Vec::new(),
             pending_read_mark: None,
+            account,
+            account_email,
+            accounts,
         }
+    }
+
+    /// Switch to the next account in the list
+    pub fn next_account(&mut self) -> bool {
+        if self.accounts.len() <= 1 {
+            return false;
+        }
+        let current_idx = self
+            .account
+            .as_ref()
+            .and_then(|a| self.accounts.iter().position(|x| x == a))
+            .unwrap_or(0);
+        let next_idx = (current_idx + 1) % self.accounts.len();
+        self.account = Some(self.accounts[next_idx].clone());
+        true
     }
 
     /// Schedule a message to be marked as read after delay

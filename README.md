@@ -121,15 +121,15 @@ message.send.backend.auth.command = "pass show gmail"
 |-----|--------|
 | `h` / `l` | Switch pane focus (list / preview) |
 | `j` / `k` | Navigate list or scroll preview |
+| `Tab` | Switch account (cycles through himalaya accounts) |
 | `Enter` | Focus preview pane |
-| `Esc` | Focus list pane |
+| `Esc` | Focus list pane / exit search results |
 
 ### Actions
 | Key | Action |
 |-----|--------|
 | `/` | Search (from/to/subject, live results) |
 | `?` | Deep search (body text, press Enter to search) |
-| `Esc` | Exit search results (return to inbox) |
 | `u` | Toggle read/unread |
 | `r` | Reply to selected message |
 | `c` | Compose new message |

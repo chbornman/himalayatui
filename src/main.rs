@@ -16,8 +16,8 @@ use std::process::Command;
 use app::{App, Pane, View};
 use config::Config;
 use himalaya::{
-    list_envelopes, mark_as_read, read_message, search_deep, search_envelopes, toggle_read,
-    Envelope,
+    get_account_email, list_accounts, list_envelopes, mark_as_read, read_message, search_deep,
+    search_envelopes, toggle_read, Envelope,
 };
 use ui::{render_compose, render_compose_help, render_envelopes, render_help, render_reader};
 
@@ -27,6 +27,15 @@ fn main() -> Result<()> {
     // Load config
     let config = Arc::new(Config::load());
 
+    // Get all accounts and find default
+    let accounts: Vec<String> = list_accounts()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.name)
+        .collect();
+    let account = accounts.first().cloned();
+    let account_email = get_account_email(account.as_deref());
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -35,8 +44,8 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Load envelopes
-    let envelopes = list_envelopes(None, None).unwrap_or_default();
-    let mut app = App::new(envelopes, config);
+    let envelopes = list_envelopes(account.as_deref(), None).unwrap_or_default();
+    let mut app = App::new(envelopes, config, account, account_email, accounts);
 
     // Load initial preview and mark as read
     load_and_mark_read(&mut app);
@@ -132,15 +141,30 @@ fn main() -> Result<()> {
                             }
                         }
                         KeyCode::Char('R') => {
-                            let envelopes = list_envelopes(None, None).unwrap_or_default();
+                            let envelopes =
+                                list_envelopes(app.account.as_deref(), None).unwrap_or_default();
                             app.refresh(envelopes);
                             app.preview_id = None; // Force reload
                             load_and_mark_read(&mut app);
                         }
+                        KeyCode::Tab => {
+                            // Switch account
+                            if app.next_account() {
+                                app.account_email = get_account_email(app.account.as_deref());
+                                let envelopes = list_envelopes(app.account.as_deref(), None)
+                                    .unwrap_or_default();
+                                app.refresh(envelopes);
+                                app.preview_id = None;
+                                load_and_mark_read(&mut app);
+                                if let Some(ref acc) = app.account {
+                                    app.set_status(&format!("Switched to {}", acc));
+                                }
+                            }
+                        }
                         KeyCode::Char('c') => {
                             app.start_compose(None);
                             // Open editor
-                            let draft = edit_message(&app.compose)?;
+                            let draft = edit_message(&app.compose, app.account_email.as_deref())?;
                             if let Some((to, subject, body)) = draft {
                                 app.compose.to = to;
                                 app.compose.subject = subject;
@@ -157,7 +181,7 @@ fn main() -> Result<()> {
                                 }
                             }
                             // Then open editor
-                            let draft = edit_message(&app.compose)?;
+                            let draft = edit_message(&app.compose, app.account_email.as_deref())?;
                             if let Some((to, subject, body)) = draft {
                                 app.compose.to = to;
                                 app.compose.subject = subject;
@@ -176,7 +200,8 @@ fn main() -> Result<()> {
                                     .unwrap_or_default();
                                 let subject = env.subject.clone().unwrap_or_default();
                                 app.start_compose(Some((&id, &to, &subject)));
-                                let draft = edit_message(&app.compose)?;
+                                let draft =
+                                    edit_message(&app.compose, app.account_email.as_deref())?;
                                 if let Some((to, subject, body)) = draft {
                                     app.compose.to = to;
                                     app.compose.subject = subject;
@@ -280,7 +305,7 @@ fn main() -> Result<()> {
                             app.set_status("Draft discarded");
                         }
                         KeyCode::Char('e') => {
-                            let draft = edit_message(&app.compose)?;
+                            let draft = edit_message(&app.compose, app.account_email.as_deref())?;
                             if let Some((to, subject, body)) = draft {
                                 app.compose.to = to;
                                 app.compose.subject = subject;
@@ -300,7 +325,7 @@ fn main() -> Result<()> {
                         KeyCode::Char('j') | KeyCode::Down => app.next_attachment(),
                         KeyCode::Char('k') | KeyCode::Up => app.prev_attachment(),
                         KeyCode::Char('s') => {
-                            if send_message(&app.compose)? {
+                            if send_message(&app.compose, app.account_email.as_deref())? {
                                 app.view = View::List;
                                 app.set_status("Message sent!");
                             } else {
@@ -407,14 +432,24 @@ fn render(app: &mut App, f: &mut Frame) {
                 .filter_map(|&i| app.envelopes.get(i).cloned())
                 .collect();
             let filtered_refs: Vec<&Envelope> = filtered.iter().collect();
+            let account_prefix = app
+                .account
+                .as_ref()
+                .map(|a| format!("[{}] ", a))
+                .unwrap_or_default();
             let title = if app.is_search_results {
-                format!("Search: {} ({} results)", app.search_query, filtered.len())
+                format!(
+                    "{}Search: {} ({} results)",
+                    account_prefix,
+                    app.search_query,
+                    filtered.len()
+                )
             } else if app.view == View::DeepSearch {
-                format!("Deep Search: {}", app.search_query)
+                format!("{}Deep Search: {}", account_prefix, app.search_query)
             } else if app.search_query.is_empty() {
-                "Inbox".to_string()
+                format!("{}Inbox", account_prefix)
             } else {
-                format!("Inbox ({} matches)", filtered.len())
+                format!("{}Inbox ({} matches)", account_prefix, filtered.len())
             };
             render_envelopes(
                 f,
@@ -491,11 +526,17 @@ fn run_search(app: &mut App) {
     }
 }
 
-fn edit_message(compose: &app::ComposeState) -> Result<Option<(String, String, String)>> {
+fn edit_message(
+    compose: &app::ComposeState,
+    from_email: Option<&str>,
+) -> Result<Option<(String, String, String)>> {
     use std::io::Write;
 
     // Create temp file with email template
     let mut temp_file = tempfile::NamedTempFile::new()?;
+    if let Some(email) = from_email {
+        writeln!(temp_file, "From: {}", email)?;
+    }
     writeln!(temp_file, "To: {}", compose.to)?;
     writeln!(temp_file, "Subject: {}", compose.subject)?;
     writeln!(temp_file)?;
@@ -579,11 +620,14 @@ fn pick_files() -> Result<Option<Vec<String>>> {
     }
 }
 
-fn send_message(compose: &app::ComposeState) -> Result<bool> {
+fn send_message(compose: &app::ComposeState, from_email: Option<&str>) -> Result<bool> {
     use std::io::Write;
 
     // Build the message with headers
     let mut temp_file = tempfile::NamedTempFile::new()?;
+    if let Some(email) = from_email {
+        writeln!(temp_file, "From: {}", email)?;
+    }
     writeln!(temp_file, "To: {}", compose.to)?;
     writeln!(temp_file, "Subject: {}", compose.subject)?;
 
