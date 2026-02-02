@@ -1,12 +1,17 @@
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
     Frame,
 };
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
 
+use super::Pane;
 use crate::config::ThemeConfig;
+
+/// Holds the stateful protocol for an image
+pub type ImageState = StatefulProtocol;
 
 /// Extract URLs from content - returns (row, col_start, col_end, url)
 pub fn extract_urls(content: &str) -> Vec<(u16, u16, u16, String)> {
@@ -103,24 +108,70 @@ pub fn render_reader(
     title: &str,
     theme: &ThemeConfig,
 ) {
-    let border_color = if focused {
-        theme.border_active()
+    render_reader_with_images(f, area, content, &mut [], scroll, focused, title, theme);
+}
+
+/// Render reader with optional inline images
+pub fn render_reader_with_images(
+    f: &mut Frame,
+    area: Rect,
+    content: &str,
+    image_states: &mut [ImageState],
+    scroll: u16,
+    focused: bool,
+    title: &str,
+    theme: &ThemeConfig,
+) {
+    let pane = Pane::new(title, focused, theme);
+    let block = pane.block();
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if image_states.is_empty() {
+        // Text only - simple case
+        let lines = style_content(content, theme);
+        let paragraph = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        f.render_widget(paragraph, inner);
     } else {
-        theme.border_subtle()
-    };
+        // Mixed content: text then images
+        let num_images = image_states.len();
 
-    let lines = style_content(content, theme);
+        // Calculate layout: text area + image areas
+        let image_height = 12u16; // Lines per image
+        let total_image_height = (num_images as u16) * image_height;
+        let text_height = inner.height.saturating_sub(total_image_height);
 
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title_style(Style::default().fg(theme.primary()))
-                .title(title),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+        let mut constraints = vec![Constraint::Length(text_height)];
+        for _ in 0..num_images {
+            constraints.push(Constraint::Length(image_height));
+        }
 
-    f.render_widget(paragraph, area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(inner);
+
+        // Render text
+        let lines = style_content(content, theme);
+        let paragraph = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        f.render_widget(paragraph, chunks[0]);
+
+        // Render images
+        for (i, state) in image_states.iter_mut().enumerate() {
+            let image_widget = StatefulImage::default();
+            f.render_stateful_widget(image_widget, chunks[i + 1], state);
+        }
+    }
+}
+
+/// Create image protocol states from images using the picker
+pub fn create_image_states(images: &[image::DynamicImage], picker: &Picker) -> Vec<ImageState> {
+    images
+        .iter()
+        .map(|img| picker.new_resize_protocol(img.clone()))
+        .collect()
 }

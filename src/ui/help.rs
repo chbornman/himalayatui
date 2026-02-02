@@ -58,21 +58,11 @@ pub fn render_help(
             Span::styled("S", key_style),
             Span::styled(" config  ", text_style),
             Span::styled("R", key_style),
-            Span::styled(" sync  ", text_style),
+            Span::styled(" reload disk  ", text_style),
             Span::styled("q", key_style),
             Span::styled(" quit", text_style),
         ],
-        View::Reader => vec![
-            Span::styled("j/k", key_style),
-            Span::styled(" scroll  ", text_style),
-            Span::styled("r", key_style),
-            Span::styled(" reply  ", text_style),
-            Span::styled("o", key_style),
-            Span::styled(" browser  ", text_style),
-            Span::styled("q/Esc", key_style),
-            Span::styled(" back", text_style),
-        ],
-        View::Loading => vec![Span::styled("Loading...", text_style)],
+
         View::DeepSearch => vec![
             Span::styled("?", deep_key_style),
             Span::raw(" "),

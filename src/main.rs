@@ -1,6 +1,6 @@
 mod app;
 mod config;
-mod himalaya;
+mod mail;
 mod ui;
 
 use anyhow::Result;
@@ -12,29 +12,33 @@ use crossterm::{
 use ratatui::prelude::*;
 use std::io;
 use std::process::Command;
+use std::sync::Arc;
 
 use app::{App, Pane, View};
 use config::Config;
-use himalaya::{
-    get_account_info, list_accounts, list_envelopes, mark_as_read, read_message, search_deep,
-    search_envelopes, toggle_read, Envelope,
+use mail::{
+    build_threaded_list, read_message_by_path, scan_all_mail, search_deep, toggle_read, Envelope,
 };
-use ui::{render_compose, render_compose_help, render_envelopes, render_help, render_reader};
-
-use std::sync::Arc;
+use ratatui_image::picker::Picker;
+use ui::{
+    render_compose, render_compose_help, render_envelopes, render_help, render_loading,
+    render_reader_with_images,
+};
 
 fn main() -> Result<()> {
     // Load config
     let config = Arc::new(Config::load());
 
-    // Get all accounts and find default
-    let accounts: Vec<String> = list_accounts()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|a| a.name)
-        .collect();
-    let account = accounts.first().cloned();
-    let account_info = get_account_info(account.as_deref());
+    // Get default account
+    let account_name = config
+        .default_account_name()
+        .ok_or_else(|| {
+            anyhow::anyhow!("No accounts configured. Add accounts to ~/.config/mailtui/config.toml")
+        })?
+        .to_string();
+    let account = config
+        .get_account(&account_name)
+        .ok_or_else(|| anyhow::anyhow!("Account '{}' not found", account_name))?;
 
     // Setup terminal
     enable_raw_mode()?;
@@ -43,20 +47,20 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Load envelopes
-    let envelopes = list_envelopes(account.as_deref(), None).unwrap_or_default();
-    let mut app = App::new(
-        envelopes,
-        config,
-        account,
-        account_info.email,
-        account_info.signature,
-        account_info.signature_delim,
-        accounts,
-    );
+    // Get account info from our config
+    let mail_dir = shellexpand::tilde(&account.maildir).to_string();
+    let user_email = account.email.clone();
 
-    // Load initial preview and mark as read
-    load_and_mark_read(&mut app);
+    // Setup image picker for Kitty protocol (falls back to halfblocks if query fails)
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+
+    // Load envelopes with progress
+    let envelopes = load_envelopes_with_progress(&mut terminal, &mail_dir, &user_email, &config)?;
+
+    let mut app = App::new(envelopes, config.clone(), account_name);
+
+    // Load initial preview with images
+    load_and_mark_read_with_images(&mut app, &picker);
 
     // Main loop
     loop {
@@ -79,10 +83,7 @@ fn main() -> Result<()> {
                         KeyCode::Esc => {
                             if app.is_search_results {
                                 app.cancel_search();
-                                app.reload_preview(|id| {
-                                    read_message(id, None)
-                                        .unwrap_or_else(|e| format!("Error: {}", e))
-                                });
+                                app.reload_preview(read_message_from_path);
                             } else {
                                 app.focused_pane = Pane::List;
                             }
@@ -96,14 +97,14 @@ fn main() -> Result<()> {
                         KeyCode::Char('j') | KeyCode::Down => match app.focused_pane {
                             Pane::List => {
                                 app.next();
-                                load_and_mark_read(&mut app);
+                                load_and_mark_read_with_images(&mut app, &picker);
                             }
                             Pane::Preview => app.preview_scroll_down(),
                         },
                         KeyCode::Char('k') | KeyCode::Up => match app.focused_pane {
                             Pane::List => {
                                 app.previous();
-                                load_and_mark_read(&mut app);
+                                load_and_mark_read_with_images(&mut app, &picker);
                             }
                             Pane::Preview => app.preview_scroll_up(),
                         },
@@ -121,9 +122,7 @@ fn main() -> Result<()> {
                         KeyCode::Char('U') => {
                             // Toggle unread-only filter
                             app.toggle_unread_filter();
-                            app.reload_preview(|id| {
-                                read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                            });
+                            app.reload_preview(read_message_from_path);
                         }
                         KeyCode::Char('o') => {
                             if let Some(env) = app.selected_envelope() {
@@ -135,123 +134,110 @@ fn main() -> Result<()> {
                         }
                         KeyCode::Char('a') => {
                             if let Some(env) = app.selected_envelope() {
-                                let id = env.id.clone();
-                                // himalaya attachment download only works with numeric IDs
-                                if id.parse::<u64>().is_err() {
-                                    app.set_status("Press R to refresh, then try again");
-                                } else {
-                                    match download_attachments(&id) {
+                                if let Some(file_path) = env.file_path.as_deref() {
+                                    match download_attachments(file_path) {
                                         Ok(files) => {
                                             if files.is_empty() {
                                                 app.set_status("No attachments");
                                             } else {
-                                                app.set_status(&format!("{} file(s)", files.len()));
+                                                app.set_status(&format!(
+                                                    "{} file(s) saved",
+                                                    files.len()
+                                                ));
                                                 // Open yazi at the first file
                                                 open_yazi(&files[0], &mut terminal)?;
                                             }
                                         }
                                         Err(e) => app.set_status(&format!("Error: {}", e)),
                                     }
+                                } else {
+                                    app.set_status("No file path for message");
                                 }
                             }
                         }
                         KeyCode::Char('R') => {
-                            app.set_status("Syncing...");
+                            // Reload envelopes from maildir (mbsync handled by systemd timer)
+                            app.set_status("Reloading...");
                             terminal.draw(|f| render(&mut app, f))?;
-                            // Run mbsync first
-                            let sync_result = Command::new("mbsync").arg("-a").output();
-                            match sync_result {
-                                Ok(output) if output.status.success() => {
-                                    // Parse new message count from mbsync output
-                                    let stderr = String::from_utf8_lossy(&output.stderr);
-                                    let new_count = stderr
-                                        .lines()
-                                        .find(|l| l.contains("pulled"))
-                                        .and_then(|l| {
-                                            l.split_whitespace()
-                                                .find(|w| w.parse::<u32>().is_ok())
-                                                .and_then(|w| w.parse::<u32>().ok())
-                                        });
-                                    // Reload envelopes
-                                    let envelopes = list_envelopes(app.account.as_deref(), None)
-                                        .unwrap_or_default();
+                            let mail_dir = app
+                                .maildir()
+                                .map(|s| shellexpand::tilde(s).to_string())
+                                .unwrap_or_default();
+                            let user_email = app.email().unwrap_or_default().to_string();
+                            match load_envelopes_with_progress(
+                                &mut terminal,
+                                &mail_dir,
+                                &user_email,
+                                &app.config,
+                            ) {
+                                Ok(envelopes) => {
                                     app.refresh(envelopes);
                                     app.preview_id = None;
                                     load_and_mark_read(&mut app);
-                                    if let Some(n) = new_count {
-                                        if n > 0 {
-                                            app.set_status(&format!("Synced: {} new", n));
-                                        } else {
-                                            app.set_status("Synced: up to date");
-                                        }
-                                    } else {
-                                        app.set_status("Synced");
-                                    }
-                                }
-                                Ok(_) => {
-                                    app.set_status("Sync failed");
+                                    app.set_status("Reloaded");
                                 }
                                 Err(e) => {
-                                    app.set_status(&format!("Sync error: {}", e));
+                                    app.set_status(&format!("Reload error: {}", e));
                                 }
                             }
                         }
                         KeyCode::Char('S') => {
-                            // Edit himalaya config (for signature, etc.)
+                            // Edit mailtui config
                             if let Some(config_path) = dirs::config_dir() {
-                                let himalaya_config = config_path.join("himalaya/config.toml");
-                                if himalaya_config.exists() {
-                                    disable_raw_mode()?;
-                                    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+                                let mailtui_config = config_path.join("mailtui/config.toml");
+                                disable_raw_mode()?;
+                                execute!(std::io::stdout(), LeaveAlternateScreen)?;
 
-                                    let editor = std::env::var("EDITOR")
-                                        .unwrap_or_else(|_| "nvim".to_string());
-                                    let _ = Command::new(&editor)
-                                        .arg("-c")
-                                        .arg("set wrap")
-                                        .arg(&himalaya_config)
-                                        .status();
+                                let editor =
+                                    std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
+                                let _ = Command::new(&editor)
+                                    .arg("-c")
+                                    .arg("set wrap")
+                                    .arg(&mailtui_config)
+                                    .status();
 
-                                    enable_raw_mode()?;
-                                    execute!(std::io::stdout(), EnterAlternateScreen)?;
-                                    terminal.clear()?;
+                                enable_raw_mode()?;
+                                execute!(std::io::stdout(), EnterAlternateScreen)?;
+                                terminal.clear()?;
 
-                                    // Reload account info after editing
-                                    let info = get_account_info(app.account.as_deref());
-                                    app.account_email = info.email;
-                                    app.account_signature = info.signature;
-                                    app.account_signature_delim = info.signature_delim;
-                                    app.set_status("Config reloaded");
-                                }
+                                // Reload config
+                                // Note: config is Arc, so we'd need to reload fully
+                                // For now just notify user to restart
+                                app.set_status("Config edited - restart to apply changes");
                             }
                         }
                         KeyCode::Tab => {
                             // Switch account
-                            if app.next_account() {
-                                let info = get_account_info(app.account.as_deref());
-                                app.account_email = info.email;
-                                app.account_signature = info.signature;
-                                app.account_signature_delim = info.signature_delim;
-                                let envelopes = list_envelopes(app.account.as_deref(), None)
+                            if let Some(new_account) = app.next_account() {
+                                let status_msg = format!("Switched to {}", new_account);
+                                // Reload envelopes from new account's maildir
+                                let mail_dir = app
+                                    .maildir()
+                                    .map(|s| shellexpand::tilde(s).to_string())
                                     .unwrap_or_default();
-                                app.refresh(envelopes);
-                                app.preview_id = None;
-                                load_and_mark_read(&mut app);
-                                if let Some(ref acc) = app.account {
-                                    app.set_status(&format!("Switched to {}", acc));
+                                let user_email = app.email().unwrap_or_default().to_string();
+                                if let Ok(envelopes) = load_envelopes_with_progress(
+                                    &mut terminal,
+                                    &mail_dir,
+                                    &user_email,
+                                    &app.config,
+                                ) {
+                                    app.refresh(envelopes);
+                                    app.preview_id = None;
+                                    load_and_mark_read(&mut app);
                                 }
+                                app.set_status(&status_msg);
                             }
                         }
                         KeyCode::Char('c') => {
                             app.start_compose(None);
                             // Open editor
                             let sig = SignatureInfo {
-                                signature: app.account_signature.as_deref(),
-                                delimiter: &app.account_signature_delim,
+                                signature: app.signature(),
+                                delimiter: app.signature_delim(),
                                 include: true,
                             };
-                            let draft =
-                                edit_message(&app.compose, app.account_email.as_deref(), sig)?;
+                            let draft = edit_message(&app.compose, app.email(), sig)?;
                             if let Some((to, subject, body)) = draft {
                                 app.compose.to = to;
                                 app.compose.subject = subject;
@@ -269,12 +255,11 @@ fn main() -> Result<()> {
                             }
                             // Then open editor
                             let sig = SignatureInfo {
-                                signature: app.account_signature.as_deref(),
-                                delimiter: &app.account_signature_delim,
+                                signature: app.signature(),
+                                delimiter: app.signature_delim(),
                                 include: true,
                             };
-                            let draft =
-                                edit_message(&app.compose, app.account_email.as_deref(), sig)?;
+                            let draft = edit_message(&app.compose, app.email(), sig)?;
                             if let Some((to, subject, body)) = draft {
                                 app.compose.to = to;
                                 app.compose.subject = subject;
@@ -294,12 +279,11 @@ fn main() -> Result<()> {
                                 let subject = env.subject.clone().unwrap_or_default();
                                 app.start_compose(Some((&id, &to, &subject)));
                                 let sig = SignatureInfo {
-                                    signature: app.account_signature.as_deref(),
-                                    delimiter: &app.account_signature_delim,
+                                    signature: app.signature(),
+                                    delimiter: app.signature_delim(),
                                     include: app.config.compose.signature_on_reply,
                                 };
-                                let draft =
-                                    edit_message(&app.compose, app.account_email.as_deref(), sig)?;
+                                let draft = edit_message(&app.compose, app.email(), sig)?;
                                 if let Some((to, subject, body)) = draft {
                                     app.compose.to = to;
                                     app.compose.subject = subject;
@@ -317,63 +301,50 @@ fn main() -> Result<()> {
                         }
                         _ => {}
                     },
-                    View::Reader => match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => app.view = View::List,
-                        _ => {}
-                    },
                     View::Search => match key.code {
                         KeyCode::Esc => {
                             app.cancel_search();
-                            app.reload_preview(|id| {
-                                read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                            });
+                            app.reload_preview(|id| read_message_from_path(id));
                         }
                         KeyCode::Enter => {
                             app.view = View::List;
-                            app.load_preview_if_needed(|id| {
-                                read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                            });
+                            app.load_preview_if_needed(|id| read_message_from_path(id));
                         }
                         KeyCode::Backspace => {
                             app.search_query.pop();
                             run_search(&mut app);
-                            app.reload_preview(|id| {
-                                read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                            });
+                            app.reload_preview(|id| read_message_from_path(id));
                         }
                         KeyCode::Char(c) => {
                             app.search_query.push(c);
                             run_search(&mut app);
-                            app.reload_preview(|id| {
-                                read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                            });
+                            app.reload_preview(|id| read_message_from_path(id));
                         }
                         KeyCode::Down | KeyCode::Tab => {
                             app.next();
-                            app.load_preview_if_needed(|id| {
-                                read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                            });
+                            app.load_preview_if_needed(|id| read_message_from_path(id));
                         }
                         KeyCode::Up => {
                             app.previous();
-                            app.load_preview_if_needed(|id| {
-                                read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                            });
+                            app.load_preview_if_needed(|id| read_message_from_path(id));
                         }
                         _ => {}
                     },
                     View::DeepSearch => match key.code {
                         KeyCode::Esc => {
                             app.cancel_search();
-                            app.reload_preview(|id| {
-                                read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                            });
+                            app.reload_preview(|id| read_message_from_path(id));
                         }
                         KeyCode::Enter => {
                             // Run deep search on Enter (it's slow so don't run on every keystroke)
                             if !app.search_query.is_empty() {
                                 app.set_status("Deep searching...");
-                                match search_deep(&app.search_query, "/home/caleb/Mail/gmail") {
+                                let mail_dir = app
+                                    .maildir()
+                                    .map(|s| shellexpand::tilde(s).to_string())
+                                    .unwrap_or_default();
+                                let user_email = app.email().unwrap_or_default();
+                                match search_deep(&app.search_query, &mail_dir, user_email) {
                                     Ok(results) => {
                                         let count = results.len();
                                         app.set_search_results(results);
@@ -385,9 +356,7 @@ fn main() -> Result<()> {
                                 }
                             }
                             app.view = View::List;
-                            app.reload_preview(|id| {
-                                read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                            });
+                            app.reload_preview(|id| read_message_from_path(id));
                         }
                         KeyCode::Backspace => {
                             app.search_query.pop();
@@ -418,8 +387,7 @@ fn main() -> Result<()> {
                                     delimiter: "",
                                     include: false,
                                 };
-                                let draft =
-                                    edit_message(&app.compose, app.account_email.as_deref(), sig)?;
+                                let draft = edit_message(&app.compose, app.email(), sig)?;
                                 if let Some((to, subject, body)) = draft {
                                     app.compose.to = to;
                                     app.compose.subject = subject;
@@ -465,7 +433,7 @@ fn main() -> Result<()> {
                             if app.confirm_send {
                                 // Already confirming, 's' confirms the send
                                 app.confirm_send = false;
-                                if send_message(&app.compose, app.account_email.as_deref())? {
+                                if send_message(&app.compose, app.email(), app.send_command())? {
                                     app.view = View::List;
                                     app.set_status("Message sent!");
                                 } else {
@@ -490,32 +458,29 @@ fn main() -> Result<()> {
                         }
                         _ => {}
                     },
-                    View::Loading => {}
                 }
             }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Down(_) => {
                     if app.handle_click(mouse.column, mouse.row) {
-                        app.load_preview_if_needed(|id| {
-                            read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                        });
+                        app.load_preview_if_needed(|id| read_message_from_path(id));
                     }
                 }
                 MouseEventKind::ScrollDown => match app.focused_pane {
                     Pane::List => {
-                        app.next();
-                        app.load_preview_if_needed(|id| {
-                            read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                        });
+                        let h = app.list_visible_height();
+                        if app.scroll_list_down(3, h) {
+                            app.load_preview_if_needed(|id| read_message_from_path(id));
+                        }
                     }
                     Pane::Preview => app.preview_scroll_down(),
                 },
                 MouseEventKind::ScrollUp => match app.focused_pane {
                     Pane::List => {
-                        app.previous();
-                        app.load_preview_if_needed(|id| {
-                            read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                        });
+                        let h = app.list_visible_height();
+                        if app.scroll_list_up(3, h) {
+                            app.load_preview_if_needed(|id| read_message_from_path(id));
+                        }
                     }
                     Pane::Preview => app.preview_scroll_up(),
                 },
@@ -556,7 +521,7 @@ fn render(app: &mut App, f: &mut Frame) {
         .split(area);
 
     match app.view {
-        View::List | View::Search | View::DeepSearch | View::Reader => {
+        View::List | View::Search | View::DeepSearch => {
             // Two-pane layout: list on left, preview on right
             // Size depends on which pane is focused
             let (list_pct, preview_pct) = match app.focused_pane {
@@ -581,18 +546,13 @@ fn render(app: &mut App, f: &mut Frame) {
             app.set_pane_areas(panes[0], panes[1]);
 
             // Left pane: envelope list
-            // Clone filtered envelopes to avoid borrow conflict with list_state
-            let filtered: Vec<Envelope> = app
+            // Collect references to filtered envelopes (no cloning)
+            let filtered_refs: Vec<&Envelope> = app
                 .filtered_indices
                 .iter()
-                .filter_map(|&i| app.envelopes.get(i).cloned())
+                .filter_map(|&i| app.envelopes.get(i))
                 .collect();
-            let filtered_refs: Vec<&Envelope> = filtered.iter().collect();
-            let account_prefix = app
-                .account
-                .as_ref()
-                .map(|a| format!("[{}] ", a))
-                .unwrap_or_default();
+            let account_prefix = format!("[{}] ", app.current_account);
             let filter_suffix = if app.show_unread_only {
                 " (Unread)"
             } else {
@@ -603,7 +563,7 @@ fn render(app: &mut App, f: &mut Frame) {
                     "{}Search: {} ({} results){}",
                     account_prefix,
                     app.search_query,
-                    filtered.len(),
+                    filtered_refs.len(),
                     filter_suffix
                 )
             } else if app.view == View::DeepSearch {
@@ -612,12 +572,12 @@ fn render(app: &mut App, f: &mut Frame) {
                     account_prefix, app.search_query, filter_suffix
                 )
             } else if app.search_query.is_empty() {
-                format!("{}Inbox{}", account_prefix, filter_suffix)
+                format!("{}Mail{}", account_prefix, filter_suffix)
             } else {
                 format!(
-                    "{}Inbox ({} matches){}",
+                    "{}Mail ({} matches){}",
                     account_prefix,
-                    filtered.len(),
+                    filtered_refs.len(),
                     filter_suffix
                 )
             };
@@ -633,15 +593,16 @@ fn render(app: &mut App, f: &mut Frame) {
                 config.layout.from_width,
             );
 
-            // Right pane: message preview with clickable URLs
+            // Right pane: message preview with clickable URLs and images
             let preview_title = app
                 .selected_envelope()
                 .and_then(|e| e.subject.clone())
                 .unwrap_or_else(|| "Message".to_string());
-            render_reader(
+            render_reader_with_images(
                 f,
                 panes[1],
                 &app.preview_content,
+                &mut app.preview_image_states,
                 app.preview_scroll,
                 app.focused_pane == Pane::Preview,
                 &preview_title,
@@ -649,14 +610,9 @@ fn render(app: &mut App, f: &mut Frame) {
             );
         }
         View::Compose => {
-            render_compose(f, chunks[0], &app.compose, app.confirm_send);
-            render_compose_help(f, chunks[1]);
+            render_compose(f, chunks[0], &app.compose, app.confirm_send, theme);
+            render_compose_help(f, chunks[1], theme);
             return;
-        }
-        View::Loading => {
-            let loading =
-                ratatui::widgets::Paragraph::new("Loading...").alignment(Alignment::Center);
-            f.render_widget(loading, chunks[0]);
         }
     }
 
@@ -677,22 +633,46 @@ fn render(app: &mut App, f: &mut Frame) {
 
 fn run_search(app: &mut App) {
     if app.search_query.is_empty() {
-        // Restore original inbox
-        app.envelopes = app.original_envelopes.clone();
+        // Restore all indices
         app.filtered_indices = (0..app.envelopes.len()).collect();
         app.is_search_results = false;
-        if !app.envelopes.is_empty() {
-            app.list_state.select(Some(0));
-        }
     } else {
-        match search_envelopes(&app.search_query) {
-            Ok(results) => {
-                app.set_search_results(results);
-            }
-            Err(_) => {
-                // Ignore errors during typing
-            }
-        }
+        // Filter in-memory by subject, from, to (case-insensitive)
+        let query_lower = app.search_query.to_lowercase();
+        app.filtered_indices = app
+            .envelopes
+            .iter()
+            .enumerate()
+            .filter(|(_, env)| {
+                // Match subject
+                if let Some(ref subj) = env.subject {
+                    if subj.to_lowercase().contains(&query_lower) {
+                        return true;
+                    }
+                }
+                // Match from
+                if let Some(ref from) = env.from {
+                    if from.addr.to_lowercase().contains(&query_lower) {
+                        return true;
+                    }
+                    if let Some(ref name) = from.name {
+                        if name.to_lowercase().contains(&query_lower) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            })
+            .map(|(i, _)| i)
+            .collect();
+        app.is_search_results = true;
+    }
+
+    // Reset selection
+    if !app.filtered_indices.is_empty() {
+        app.list_state.select(Some(0));
+    } else {
+        app.list_state.select(None);
     }
 }
 
@@ -809,33 +789,110 @@ fn pick_files() -> Result<Option<Vec<String>>> {
     }
 }
 
-fn send_message(compose: &app::ComposeState, from_email: Option<&str>) -> Result<bool> {
+fn send_message(
+    compose: &app::ComposeState,
+    from_email: Option<&str>,
+    send_command: &str,
+) -> Result<bool> {
     use std::io::Write;
+    use std::process::Stdio;
 
     // Build the message with headers
-    let mut temp_file = tempfile::NamedTempFile::new()?;
+    let mut message = String::new();
     if let Some(email) = from_email {
-        writeln!(temp_file, "From: {}", email)?;
+        message.push_str(&format!("From: {}\n", email));
     }
-    writeln!(temp_file, "To: {}", compose.to)?;
-    writeln!(temp_file, "Subject: {}", compose.subject)?;
+    message.push_str(&format!("To: {}\n", compose.to));
+    message.push_str(&format!("Subject: {}\n", compose.subject));
+    message.push_str("MIME-Version: 1.0\n");
 
-    for attachment in &compose.attachments {
-        writeln!(temp_file, "Attachment: {}", attachment)?;
+    if compose.attachments.is_empty() {
+        // Simple text message
+        message.push_str("Content-Type: text/plain; charset=utf-8\n\n");
+        message.push_str(&compose.body);
+    } else {
+        // Multipart message with attachments
+        let boundary = format!(
+            "----=_Part_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
+        message.push_str(&format!(
+            "Content-Type: multipart/mixed; boundary=\"{}\"\n\n",
+            boundary
+        ));
+
+        // Text body part
+        message.push_str(&format!("--{}\n", boundary));
+        message.push_str("Content-Type: text/plain; charset=utf-8\n\n");
+        message.push_str(&compose.body);
+        message.push_str("\n");
+
+        // Attachment parts
+        for attachment_path in &compose.attachments {
+            let path = std::path::Path::new(attachment_path);
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("attachment");
+            let data = std::fs::read(path)?;
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+
+            // Guess content type
+            let content_type = match path.extension().and_then(|e| e.to_str()) {
+                Some("pdf") => "application/pdf",
+                Some("png") => "image/png",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                Some("gif") => "image/gif",
+                Some("txt") => "text/plain",
+                Some("html") => "text/html",
+                Some("zip") => "application/zip",
+                _ => "application/octet-stream",
+            };
+
+            message.push_str(&format!("--{}\n", boundary));
+            message.push_str(&format!(
+                "Content-Type: {}; name=\"{}\"\n",
+                content_type, filename
+            ));
+            message.push_str("Content-Transfer-Encoding: base64\n");
+            message.push_str(&format!(
+                "Content-Disposition: attachment; filename=\"{}\"\n\n",
+                filename
+            ));
+
+            // Line-wrap base64 at 76 chars
+            for chunk in encoded.as_bytes().chunks(76) {
+                message.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+                message.push('\n');
+            }
+        }
+
+        message.push_str(&format!("--{}--\n", boundary));
     }
 
-    writeln!(temp_file)?;
-    write!(temp_file, "{}", compose.body)?;
-    temp_file.flush()?;
+    // Parse send command (e.g., "msmtp -t" -> ["msmtp", "-t"])
+    let parts: Vec<&str> = send_command.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err(anyhow::anyhow!("Empty send command"));
+    }
 
-    let path = temp_file.path();
+    let mut cmd = Command::new(parts[0]);
+    for arg in &parts[1..] {
+        cmd.arg(arg);
+    }
 
-    // Send via himalaya
-    let status = Command::new("himalaya")
-        .args(["message", "send"])
-        .stdin(std::fs::File::open(path)?)
-        .status()?;
+    let mut child = cmd.stdin(Stdio::piped()).spawn()?;
 
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(message.as_bytes())?;
+    }
+
+    let status = child.wait()?;
     Ok(status.success())
 }
 
@@ -856,35 +913,10 @@ fn open_in_browser_search(subject: Option<&str>, from: Option<&str>) {
     let _ = Command::new("xdg-open").arg(&url).spawn();
 }
 
-fn download_attachments(id: &str) -> Result<Vec<String>> {
-    let output = Command::new("himalaya")
-        .args(["attachment", "download", id])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!("{}", stderr.trim()));
-    }
-
-    // Filenames are printed to stderr, not stdout
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Parse filenames from output like: Downloading "/home/caleb/Downloads/file.jpg"…
-    let files: Vec<String> = stderr
-        .lines()
-        .filter(|line| line.starts_with("Downloading"))
-        .filter_map(|line| {
-            let start = line.find('"')?;
-            let end = line.rfind('"')?;
-            if start < end {
-                Some(line[start + 1..end].to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    Ok(files)
+fn download_attachments(file_path: &str) -> Result<Vec<String>> {
+    // Download to ~/Downloads
+    let download_dir = dirs::download_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    mail::save_attachments(file_path, &download_dir)
 }
 
 fn open_yazi(path: &str, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
@@ -911,12 +943,31 @@ fn load_and_mark_read(app: &mut App) {
         .map(|e| !e.flags.contains(&"Seen".to_string()))
         .unwrap_or(false);
 
-    app.load_preview_if_needed(|id| {
-        read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-    });
+    app.load_preview_if_needed(|id| read_message_from_path(id));
 
     // Schedule read mark if message is unread (750ms debounce)
-    // Works with both himalaya numeric IDs and notmuch maildir IDs
+    if let Some(id) = id {
+        if is_unread {
+            app.schedule_read_mark(id);
+        }
+    }
+}
+
+/// Load preview for current selection with images and schedule read mark (debounced)
+fn load_and_mark_read_with_images(app: &mut App, picker: &Picker) {
+    // Cancel any pending read mark from previous selection
+    app.cancel_pending_read_mark();
+
+    // Get ID before loading
+    let id = app.selected_envelope().map(|e| e.id.clone());
+    let is_unread = app
+        .selected_envelope()
+        .map(|e| !e.flags.contains(&"Seen".to_string()))
+        .unwrap_or(false);
+
+    app.load_preview_with_images(|id| read_message_with_images(id), picker);
+
+    // Schedule read mark if message is unread (750ms debounce)
     if let Some(id) = id {
         if is_unread {
             app.schedule_read_mark(id);
@@ -926,8 +977,67 @@ fn load_and_mark_read(app: &mut App) {
 
 /// Process pending read marks (call in main loop)
 fn process_pending_read_marks(app: &mut App) {
-    if let Some(id) = app.check_pending_read_mark() {
-        let _ = mark_as_read(&id);
+    if let Some(_id) = app.check_pending_read_mark() {
+        // For now, skip marking as read since we're using maildir directly
+        // TODO: Update maildir flags directly
         app.mark_current_read();
+    }
+}
+
+/// Load envelopes from maildir with progress display
+fn load_envelopes_with_progress(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    mail_dir: &str,
+    user_email: &str,
+    config: &Config,
+) -> Result<Vec<Envelope>> {
+    // Show initial loading screen
+    terminal.draw(|f| {
+        render_loading(f, f.area(), 0.0, 0, 0, "Scanning maildir...", &config.theme);
+    })?;
+
+    // Run scan_all_mail directly on main thread (Rayon will spawn worker threads)
+    // Progress updates won't show smoothly but parallelism will work
+    let envelopes = scan_all_mail(mail_dir, user_email, |_current, _total| {
+        // Progress callback - we can't easily update UI from here
+        // since we're on the main thread doing work
+    })?;
+
+    // Show threading progress
+    terminal.draw(|f| {
+        render_loading(
+            f,
+            f.area(),
+            1.0,
+            envelopes.len(),
+            envelopes.len(),
+            "Building threads...",
+            &config.theme,
+        );
+    })?;
+
+    let threaded = build_threaded_list(envelopes);
+    Ok(threaded)
+}
+
+/// Read message content from path (used by load_preview_if_needed)
+fn read_message_from_path(path: &str) -> String {
+    read_message_by_path(path).unwrap_or_else(|e| format!("Error: {}", e))
+}
+
+/// Read message content with images from path
+fn read_message_with_images(path: &str) -> (String, Vec<image::DynamicImage>) {
+    use mail::read_message_content;
+
+    match read_message_content(path) {
+        Ok(content) => {
+            let images: Vec<image::DynamicImage> = content
+                .images
+                .iter()
+                .filter_map(|img| image::load_from_memory(&img.data).ok())
+                .collect();
+            (content.text, images)
+        }
+        Err(e) => (format!("Error: {}", e), Vec::new()),
     }
 }

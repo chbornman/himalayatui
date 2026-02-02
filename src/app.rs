@@ -3,13 +3,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config::Config;
-use crate::himalaya::Envelope;
+use crate::mail::Envelope;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum View {
     List,
-    Reader,
-    Loading,
     Search,
     DeepSearch,
     Compose,
@@ -28,19 +26,18 @@ pub struct App {
     pub original_envelopes: Vec<Envelope>, // Store original list for cancel
     pub filtered_indices: Vec<usize>,
     pub list_state: ListState,
-    pub message_content: String,
-    pub scroll: u16,
     pub should_quit: bool,
     pub status_message: Option<String>,
-    pub current_message_id: Option<String>,
-    pub current_subject: Option<String>,
-    pub current_from: Option<String>,
     pub search_query: String,
     pub is_search_results: bool,
+    // Current account
+    pub current_account: String,
     // Compose state
     pub compose: ComposeState,
     // Preview pane state
     pub preview_content: String,
+    pub preview_images: Vec<image::DynamicImage>,
+    pub preview_image_states: Vec<ratatui_image::protocol::StatefulProtocol>,
     pub preview_id: Option<String>,
     pub preview_scroll: u16,
     // Pane focus
@@ -52,12 +49,6 @@ pub struct App {
     pub preview_urls: Vec<(u16, u16, u16, String)>,
     // Debounced read marking: (message_id, opened_at)
     pub pending_read_mark: Option<(String, Instant)>,
-    // Current account
-    pub account: Option<String>,
-    pub account_email: Option<String>,
-    pub account_signature: Option<String>,
-    pub account_signature_delim: String,
-    pub accounts: Vec<String>,
     // Inbox filter
     pub show_unread_only: bool,
     // Send confirmation
@@ -75,15 +66,7 @@ pub struct ComposeState {
 }
 
 impl App {
-    pub fn new(
-        envelopes: Vec<Envelope>,
-        config: Arc<Config>,
-        account: Option<String>,
-        account_email: Option<String>,
-        account_signature: Option<String>,
-        account_signature_delim: String,
-        accounts: Vec<String>,
-    ) -> Self {
+    pub fn new(envelopes: Vec<Envelope>, config: Arc<Config>, account_name: String) -> Self {
         let mut list_state = ListState::default();
         if !envelopes.is_empty() {
             list_state.select(Some(0));
@@ -98,17 +81,15 @@ impl App {
             envelopes,
             filtered_indices,
             list_state,
-            message_content: String::new(),
-            scroll: 0,
             should_quit: false,
             status_message: None,
-            current_message_id: None,
-            current_subject: None,
-            current_from: None,
             search_query: String::new(),
             is_search_results: false,
+            current_account: account_name,
             compose: ComposeState::default(),
             preview_content: String::new(),
+            preview_images: Vec::new(),
+            preview_image_states: Vec::new(),
             preview_id: None,
             preview_scroll: 0,
             focused_pane: Pane::List,
@@ -116,29 +97,60 @@ impl App {
             preview_area: Rect::default(),
             preview_urls: Vec::new(),
             pending_read_mark: None,
-            account,
-            account_email,
-            account_signature,
-            account_signature_delim,
-            accounts,
             show_unread_only: false,
             confirm_send: false,
         }
     }
 
-    /// Switch to the next account in the list
-    pub fn next_account(&mut self) -> bool {
-        if self.accounts.len() <= 1 {
-            return false;
+    /// Get current account config
+    pub fn account(&self) -> Option<&crate::config::AccountConfig> {
+        self.config.get_account(&self.current_account)
+    }
+
+    /// Get current account's email address
+    pub fn email(&self) -> Option<&str> {
+        self.account()
+            .map(|a| a.email.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Get current account's signature
+    pub fn signature(&self) -> Option<&str> {
+        self.account().and_then(|a| a.signature.as_deref())
+    }
+
+    /// Get current account's signature delimiter
+    pub fn signature_delim(&self) -> &str {
+        self.account()
+            .map(|a| a.signature_delim.as_str())
+            .unwrap_or("-- \n")
+    }
+
+    /// Get current account's maildir path
+    pub fn maildir(&self) -> Option<&str> {
+        self.account().map(|a| a.maildir.as_str())
+    }
+
+    /// Get current account's send command
+    pub fn send_command(&self) -> &str {
+        self.account()
+            .map(|a| a.send_command.as_str())
+            .unwrap_or("msmtp -t")
+    }
+
+    /// Switch to the next account in the list, returns new account name if switched
+    pub fn next_account(&mut self) -> Option<String> {
+        let names = self.config.account_names();
+        if names.len() <= 1 {
+            return None;
         }
-        let current_idx = self
-            .account
-            .as_ref()
-            .and_then(|a| self.accounts.iter().position(|x| x == a))
+        let current_idx = names
+            .iter()
+            .position(|n| n == &self.current_account)
             .unwrap_or(0);
-        let next_idx = (current_idx + 1) % self.accounts.len();
-        self.account = Some(self.accounts[next_idx].clone());
-        true
+        let next_idx = (current_idx + 1) % names.len();
+        self.current_account = names[next_idx].clone();
+        Some(self.current_account.clone())
     }
 
     /// Schedule a message to be marked as read after delay
@@ -192,8 +204,9 @@ impl App {
         if self.filtered_indices.is_empty() {
             return;
         }
+        let max = self.filtered_indices.len() - 1;
         let i = match self.list_state.selected() {
-            Some(i) => (i + 1).min(self.filtered_indices.len() - 1),
+            Some(i) => (i + 1).min(max),
             None => 0,
         };
         self.list_state.select(Some(i));
@@ -210,39 +223,63 @@ impl App {
         self.list_state.select(Some(i));
     }
 
+    /// Scroll list viewport down, moving selection if needed to stay in view
+    /// Returns true if selection changed
+    pub fn scroll_list_down(&mut self, lines: usize, visible_height: usize) -> bool {
+        if self.filtered_indices.is_empty() {
+            return false;
+        }
+        let max_offset = self.filtered_indices.len().saturating_sub(1);
+        let current_offset = self.list_state.offset();
+        let new_offset = (current_offset + lines).min(max_offset);
+        *self.list_state.offset_mut() = new_offset;
+
+        let old_selected = self.list_state.selected();
+
+        // If selection is now above viewport, move it down
+        if let Some(selected) = old_selected {
+            if selected < new_offset {
+                self.list_state.select(Some(new_offset));
+            } else if selected >= new_offset + visible_height {
+                // Selection below viewport, move it up
+                self.list_state
+                    .select(Some(new_offset + visible_height - 1));
+            }
+        }
+
+        self.list_state.selected() != old_selected
+    }
+
+    /// Scroll list viewport up, moving selection if needed to stay in view
+    /// Returns true if selection changed
+    pub fn scroll_list_up(&mut self, lines: usize, visible_height: usize) -> bool {
+        if self.filtered_indices.is_empty() {
+            return false;
+        }
+        let current_offset = self.list_state.offset();
+        let new_offset = current_offset.saturating_sub(lines);
+        *self.list_state.offset_mut() = new_offset;
+
+        let old_selected = self.list_state.selected();
+
+        // If selection is now below viewport, move it up
+        if let Some(selected) = old_selected {
+            let max_visible = new_offset + visible_height - 1;
+            if selected > max_visible {
+                self.list_state
+                    .select(Some(max_visible.min(self.filtered_indices.len() - 1)));
+            } else if selected < new_offset {
+                // Selection above viewport, move it down
+                self.list_state.select(Some(new_offset));
+            }
+        }
+
+        self.list_state.selected() != old_selected
+    }
+
     pub fn start_search(&mut self) {
         self.search_query.clear();
         self.view = View::Search;
-    }
-
-    pub fn update_search(&mut self) {
-        let query = self.search_query.to_lowercase();
-        self.filtered_indices = self
-            .envelopes
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                // Apply unread filter first
-                if self.show_unread_only && e.flags.contains(&"Seen".to_string()) {
-                    return false;
-                }
-                if query.is_empty() {
-                    return true;
-                }
-                let subject = e.subject.as_deref().unwrap_or("").to_lowercase();
-                let from = e.from_display().to_lowercase();
-                // Fuzzy: check if all chars appear in order
-                fuzzy_match(&subject, &query) || fuzzy_match(&from, &query)
-            })
-            .map(|(i, _)| i)
-            .collect();
-
-        // Reset selection
-        if !self.filtered_indices.is_empty() {
-            self.list_state.select(Some(0));
-        } else {
-            self.list_state.select(None);
-        }
     }
 
     /// Toggle unread-only filter and recompute filtered_indices
@@ -288,10 +325,6 @@ impl App {
         }
     }
 
-    pub fn confirm_search(&mut self) {
-        self.view = View::List;
-    }
-
     pub fn cancel_search(&mut self) {
         self.search_query.clear();
         // Restore original envelopes if we were showing search results
@@ -309,14 +342,6 @@ impl App {
         self.apply_filter();
     }
 
-    pub fn scroll_down(&mut self) {
-        self.scroll = self.scroll.saturating_add(1);
-    }
-
-    pub fn scroll_up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(1);
-    }
-
     pub fn preview_scroll_down(&mut self) {
         self.preview_scroll = self.preview_scroll.saturating_add(3);
     }
@@ -326,11 +351,15 @@ impl App {
     }
 
     /// Load preview for currently selected envelope if not already loaded
+    /// The loader function receives the file_path (preferred) or id
     pub fn load_preview_if_needed(&mut self, loader: impl FnOnce(&str) -> String) {
         if let Some(env) = self.selected_envelope() {
             let id = env.id.clone();
             if self.preview_id.as_ref() != Some(&id) {
-                self.preview_content = loader(&id);
+                // Use file_path if available, otherwise fall back to id
+                let path_or_id = env.file_path.as_deref().unwrap_or(&id);
+                self.preview_content = loader(path_or_id);
+                self.preview_images.clear();
                 self.preview_id = Some(id);
                 self.preview_scroll = 0;
                 // Extract URLs for click handling
@@ -338,6 +367,41 @@ impl App {
             }
         } else {
             self.preview_content.clear();
+            self.preview_images.clear();
+            self.preview_id = None;
+            self.preview_scroll = 0;
+            self.preview_urls.clear();
+        }
+    }
+
+    /// Load preview with images for currently selected envelope
+    pub fn load_preview_with_images(
+        &mut self,
+        loader: impl FnOnce(&str) -> (String, Vec<image::DynamicImage>),
+        picker: &ratatui_image::picker::Picker,
+    ) {
+        if let Some(env) = self.selected_envelope() {
+            let id = env.id.clone();
+            if self.preview_id.as_ref() != Some(&id) {
+                // Use file_path if available, otherwise fall back to id
+                let path_or_id = env.file_path.as_deref().unwrap_or(&id);
+                let (text, images) = loader(path_or_id);
+                self.preview_content = text;
+                // Create image states for rendering
+                self.preview_image_states = images
+                    .iter()
+                    .map(|img| picker.new_resize_protocol(img.clone()))
+                    .collect();
+                self.preview_images = images;
+                self.preview_id = Some(id);
+                self.preview_scroll = 0;
+                // Extract URLs for click handling
+                self.preview_urls = crate::ui::extract_urls(&self.preview_content);
+            }
+        } else {
+            self.preview_content.clear();
+            self.preview_images.clear();
+            self.preview_image_states.clear();
             self.preview_id = None;
             self.preview_scroll = 0;
             self.preview_urls.clear();
@@ -348,6 +412,16 @@ impl App {
     pub fn reload_preview(&mut self, loader: impl FnOnce(&str) -> String) {
         self.preview_id = None;
         self.load_preview_if_needed(loader);
+    }
+
+    /// Force reload preview with images
+    pub fn reload_preview_with_images(
+        &mut self,
+        loader: impl FnOnce(&str) -> (String, Vec<image::DynamicImage>),
+        picker: &ratatui_image::picker::Picker,
+    ) {
+        self.preview_id = None;
+        self.load_preview_with_images(loader, picker);
     }
 
     /// Mark current email as read in local state
@@ -386,6 +460,11 @@ impl App {
     pub fn set_pane_areas(&mut self, list: Rect, preview: Rect) {
         self.list_area = list;
         self.preview_area = preview;
+    }
+
+    /// Get visible height of list (excluding borders)
+    pub fn list_visible_height(&self) -> usize {
+        self.list_area.height.saturating_sub(2) as usize // -2 for top and bottom borders
     }
 
     /// Handle click at (x, y) - returns true if email selection changed
@@ -436,13 +515,6 @@ impl App {
             }
         }
         None
-    }
-
-    pub fn filtered_envelopes(&self) -> Vec<&Envelope> {
-        self.filtered_indices
-            .iter()
-            .filter_map(|&i| self.envelopes.get(i))
-            .collect()
     }
 
     pub fn start_compose(&mut self, reply_to: Option<(&str, &str, &str)>) {

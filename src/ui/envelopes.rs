@@ -2,12 +2,13 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState},
+    widgets::{List, ListItem, ListState},
     Frame,
 };
 
+use super::Pane;
 use crate::config::ThemeConfig;
-use crate::himalaya::Envelope;
+use crate::mail::Envelope;
 
 pub fn render_envelopes(
     f: &mut Frame,
@@ -22,17 +23,28 @@ pub fn render_envelopes(
 ) {
     // Available width: area minus borders (2) minus highlight symbol (2)
     let avail_width = area.width.saturating_sub(4) as usize;
-    let from_w = from_width.min(avail_width.saturating_sub(date_width + 4) / 3);
-    let subject_width = avail_width.saturating_sub(date_width + from_w + 4);
+    // Account for tree prefix (max ~9 chars for "│  └─ ") and sent indicator (~7 chars for " ┤sent├")
+    let tree_prefix_reserve = 10;
+    let sent_indicator_reserve = 8;
+    let content_width = avail_width.saturating_sub(tree_prefix_reserve + sent_indicator_reserve);
+    let from_w = from_width.min(content_width.saturating_sub(date_width + 4) / 3);
+    let subject_width = content_width.saturating_sub(date_width + from_w + 4);
 
     let items: Vec<ListItem> = envelopes
         .iter()
         .map(|e| {
             let is_unread = !e.flags.contains(&"Seen".to_string());
             let has_attach = e.has_attachment;
+            let has_images = e.has_inline_images;
 
             let unread_marker = if is_unread { "*" } else { " " };
-            let attach_marker = if has_attach { "@" } else { " " };
+            let attach_marker = if has_attach {
+                "@"
+            } else if has_images {
+                "🖼"
+            } else {
+                " "
+            };
             let from = e.from_display();
             let subject = e.subject.as_deref().unwrap_or("(no subject)");
             let date = format_date(e.date.as_deref().unwrap_or(""));
@@ -50,18 +62,31 @@ pub fn render_envelopes(
                 spans.push(Span::raw(unread_marker));
             }
 
-            // Attachment marker with color
+            // Attachment/image marker with color
             if has_attach {
                 spans.push(Span::styled(
                     attach_marker,
                     Style::default().fg(theme.attachment()),
                 ));
+            } else if has_images {
+                spans.push(Span::styled(
+                    attach_marker,
+                    Style::default().fg(theme.primary()),
+                ));
             } else {
                 spans.push(Span::raw(attach_marker));
             }
 
-            // Rest of line
-            let rest = format!(
+            // Tree prefix for threading (indentation)
+            if !e.tree_prefix.is_empty() {
+                spans.push(Span::styled(
+                    e.tree_prefix.clone(),
+                    Style::default().fg(theme.fg_subtle()),
+                ));
+            }
+
+            // Main content: date, from, subject
+            let main_content = format!(
                 " {:dw$} {:fw$} {}",
                 truncate(&date, date_width),
                 truncate(&from, from_w),
@@ -70,33 +95,42 @@ pub fn render_envelopes(
                 fw = from_w,
             );
 
-            if is_unread {
-                spans.push(Span::styled(
-                    rest,
-                    Style::default().fg(theme.fg()).add_modifier(Modifier::BOLD),
-                ));
+            // Thread replies (depth > 0) get more muted colors
+            let is_thread_reply = e.thread_depth > 0;
+
+            let text_color = if is_unread {
+                if is_thread_reply {
+                    theme.fg_muted() // Unread reply: muted but not as dim
+                } else {
+                    theme.fg() // Unread root: bright white
+                }
+            } else if is_thread_reply {
+                theme.fg_subtle() // Read reply: quite dim
             } else {
-                spans.push(Span::styled(rest, Style::default().fg(theme.fg_muted())));
+                theme.fg_muted() // Read root: normal muted
+            };
+
+            let style = if is_unread && !is_thread_reply {
+                Style::default().fg(text_color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(text_color)
+            };
+
+            spans.push(Span::styled(main_content, style));
+
+            // Sent indicator with box-breaking style
+            if e.is_sent {
+                spans.push(Span::styled(" ┤sent├", Style::default().fg(theme.sent())));
             }
 
             ListItem::new(Line::from(spans))
         })
         .collect();
 
-    let border_color = if focused {
-        theme.border_active()
-    } else {
-        theme.border_subtle()
-    };
+    let pane = Pane::new(title, focused, theme);
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border_color))
-                .title_style(Style::default().fg(theme.primary()))
-                .title(title.to_string()),
-        )
+        .block(pane.block())
         .highlight_style(
             Style::default()
                 .bg(theme.selected_bg())

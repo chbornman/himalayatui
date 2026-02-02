@@ -4,10 +4,29 @@ use std::path::PathBuf;
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Default account name (if not set, uses first account)
+    pub default_account: Option<String>,
+    /// Named accounts
+    #[serde(default)]
+    pub accounts: std::collections::HashMap<String, AccountConfig>,
     pub layout: LayoutConfig,
-    pub paths: PathsConfig,
     pub theme: ThemeConfig,
     pub compose: ComposeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AccountConfig {
+    /// Your email address (used for From: header and detecting sent mail)
+    pub email: String,
+    /// Maildir path for this account
+    pub maildir: String,
+    /// Email signature (appended to composed messages)
+    pub signature: Option<String>,
+    /// Signature delimiter (default: "-- \n")
+    pub signature_delim: String,
+    /// Command to send mail (default: "msmtp -t")
+    pub send_command: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,13 +47,6 @@ pub struct LayoutConfig {
     pub date_width: usize,
     /// From column width in characters
     pub from_width: usize,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct PathsConfig {
-    /// Mail directory for deep search
-    pub mail_dir: String,
 }
 
 /// Semantic theme configuration using Capstan Cloud colors as defaults
@@ -76,11 +88,45 @@ pub struct ThemeConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            default_account: None,
+            accounts: std::collections::HashMap::new(),
             layout: LayoutConfig::default(),
-            paths: PathsConfig::default(),
             theme: ThemeConfig::default(),
             compose: ComposeConfig::default(),
         }
+    }
+}
+
+impl Default for AccountConfig {
+    fn default() -> Self {
+        Self {
+            email: String::new(),
+            maildir: shellexpand::tilde("~/Mail").into_owned(),
+            signature: None,
+            signature_delim: "-- \n".to_string(),
+            send_command: "msmtp -t".to_string(),
+        }
+    }
+}
+
+impl Config {
+    /// Get account names in sorted order
+    pub fn account_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.accounts.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Get the default account name
+    pub fn default_account_name(&self) -> Option<&str> {
+        self.default_account
+            .as_deref()
+            .or_else(|| self.accounts.keys().next().map(|s| s.as_str()))
+    }
+
+    /// Get account config by name
+    pub fn get_account(&self, name: &str) -> Option<&AccountConfig> {
+        self.accounts.get(name)
     }
 }
 
@@ -99,14 +145,6 @@ impl Default for LayoutConfig {
             preview_focused_width: 67,
             date_width: 14,
             from_width: 18,
-        }
-    }
-}
-
-impl Default for PathsConfig {
-    fn default() -> Self {
-        Self {
-            mail_dir: shellexpand::tilde("~/Mail/gmail").into_owned(),
         }
     }
 }
@@ -152,8 +190,8 @@ impl Default for ThemeConfig {
 impl Config {
     pub fn load() -> Self {
         let config_path = dirs::config_dir()
-            .map(|p| p.join("himalayatui/config.toml"))
-            .unwrap_or_else(|| PathBuf::from("~/.config/himalayatui/config.toml"));
+            .map(|p| p.join("mailtui/config.toml"))
+            .unwrap_or_else(|| PathBuf::from("~/.config/mailtui/config.toml"));
 
         if config_path.exists() {
             match std::fs::read_to_string(&config_path) {
@@ -170,11 +208,6 @@ impl Config {
 }
 
 impl ThemeConfig {
-    /// Parse a color string to ratatui Color
-    pub fn parse_color(&self, color: &str) -> ratatui::style::Color {
-        parse_color(color)
-    }
-
     // Convenience methods for common colors
     pub fn bg(&self) -> ratatui::style::Color {
         parse_color(&self.bg)
@@ -206,12 +239,16 @@ impl ThemeConfig {
     pub fn primary(&self) -> ratatui::style::Color {
         parse_color(&self.primary)
     }
+    /// Lighter variant of primary (planned for hover states)
+    #[allow(dead_code)]
     pub fn primary_light(&self) -> ratatui::style::Color {
         parse_color(&self.primary_light)
     }
     pub fn secondary(&self) -> ratatui::style::Color {
         parse_color(&self.secondary)
     }
+    /// Lighter variant of secondary (planned for hover states)
+    #[allow(dead_code)]
     pub fn secondary_light(&self) -> ratatui::style::Color {
         parse_color(&self.secondary_light)
     }
@@ -221,9 +258,13 @@ impl ThemeConfig {
     pub fn warning(&self) -> ratatui::style::Color {
         parse_color(&self.warning)
     }
+    /// Error color (planned for error messages/states)
+    #[allow(dead_code)]
     pub fn error(&self) -> ratatui::style::Color {
         parse_color(&self.error)
     }
+    /// Info color (planned for informational highlights)
+    #[allow(dead_code)]
     pub fn info(&self) -> ratatui::style::Color {
         parse_color(&self.info)
     }
@@ -238,6 +279,9 @@ impl ThemeConfig {
     }
     pub fn attachment(&self) -> ratatui::style::Color {
         parse_color(&self.attachment)
+    }
+    pub fn sent(&self) -> ratatui::style::Color {
+        parse_color(&self.secondary)
     }
 }
 
