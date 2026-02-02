@@ -58,7 +58,7 @@ pub fn render_help(
             Span::styled("S", key_style),
             Span::styled(" config  ", text_style),
             Span::styled("R", key_style),
-            Span::styled(" refresh  ", text_style),
+            Span::styled(" sync  ", text_style),
             Span::styled("q", key_style),
             Span::styled(" quit", text_style),
         ],

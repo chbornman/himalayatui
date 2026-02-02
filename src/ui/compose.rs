@@ -1,14 +1,14 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
 use crate::app::ComposeState;
 
-pub fn render_compose(f: &mut Frame, area: Rect, compose: &ComposeState) {
+pub fn render_compose(f: &mut Frame, area: Rect, compose: &ComposeState, confirm_send: bool) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -73,6 +73,39 @@ pub fn render_compose(f: &mut Frame, area: Rect, compose: &ComposeState) {
             .title(format!("Attachments ({})", compose.attachments.len())),
     );
     f.render_widget(attachments, chunks[2]);
+
+    // Render confirmation modal if needed
+    if confirm_send {
+        let modal_width = 40;
+        let modal_height = 5;
+        let modal_x = (area.width.saturating_sub(modal_width)) / 2 + area.x;
+        let modal_y = (area.height.saturating_sub(modal_height)) / 2 + area.y;
+        let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+        // Clear the area behind the modal
+        f.render_widget(Clear, modal_area);
+
+        let modal_text = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Send this email?",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw("Press 's' to confirm, any key to cancel")),
+        ];
+
+        let modal = Paragraph::new(modal_text)
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" Confirm ")
+                    .title_alignment(Alignment::Center),
+            );
+
+        f.render_widget(modal, modal_area);
+    }
 }
 
 pub fn render_compose_help(f: &mut Frame, area: Rect) {

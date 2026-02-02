@@ -156,11 +156,45 @@ fn main() -> Result<()> {
                             }
                         }
                         KeyCode::Char('R') => {
-                            let envelopes =
-                                list_envelopes(app.account.as_deref(), None).unwrap_or_default();
-                            app.refresh(envelopes);
-                            app.preview_id = None; // Force reload
-                            load_and_mark_read(&mut app);
+                            app.set_status("Syncing...");
+                            terminal.draw(|f| render(&mut app, f))?;
+                            // Run mbsync first
+                            let sync_result = Command::new("mbsync").arg("-a").output();
+                            match sync_result {
+                                Ok(output) if output.status.success() => {
+                                    // Parse new message count from mbsync output
+                                    let stderr = String::from_utf8_lossy(&output.stderr);
+                                    let new_count = stderr
+                                        .lines()
+                                        .find(|l| l.contains("pulled"))
+                                        .and_then(|l| {
+                                            l.split_whitespace()
+                                                .find(|w| w.parse::<u32>().is_ok())
+                                                .and_then(|w| w.parse::<u32>().ok())
+                                        });
+                                    // Reload envelopes
+                                    let envelopes = list_envelopes(app.account.as_deref(), None)
+                                        .unwrap_or_default();
+                                    app.refresh(envelopes);
+                                    app.preview_id = None;
+                                    load_and_mark_read(&mut app);
+                                    if let Some(n) = new_count {
+                                        if n > 0 {
+                                            app.set_status(&format!("Synced: {} new", n));
+                                        } else {
+                                            app.set_status("Synced: up to date");
+                                        }
+                                    } else {
+                                        app.set_status("Synced");
+                                    }
+                                }
+                                Ok(_) => {
+                                    app.set_status("Sync failed");
+                                }
+                                Err(e) => {
+                                    app.set_status(&format!("Sync error: {}", e));
+                                }
+                            }
                         }
                         KeyCode::Char('S') => {
                             // Edit himalaya config (for signature, etc.)
@@ -172,7 +206,11 @@ fn main() -> Result<()> {
 
                                     let editor = std::env::var("EDITOR")
                                         .unwrap_or_else(|_| "nvim".to_string());
-                                    let _ = Command::new(&editor).arg(&himalaya_config).status();
+                                    let _ = Command::new(&editor)
+                                        .arg("-c")
+                                        .arg("set wrap")
+                                        .arg(&himalaya_config)
+                                        .status();
 
                                     enable_raw_mode()?;
                                     execute!(std::io::stdout(), EnterAlternateScreen)?;
@@ -360,43 +398,94 @@ fn main() -> Result<()> {
                         _ => {}
                     },
                     View::Compose => match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            app.view = View::List;
-                            app.set_status("Draft discarded");
+                        KeyCode::Char('q') => {
+                            if app.confirm_send {
+                                app.confirm_send = false;
+                                app.set_status("Send cancelled");
+                            } else {
+                                app.view = View::List;
+                                app.set_status("Draft discarded");
+                            }
                         }
                         KeyCode::Char('e') => {
-                            // When re-editing, don't add signature again (it's already in body)
-                            let sig = SignatureInfo {
-                                signature: None,
-                                delimiter: "",
-                                include: false,
-                            };
-                            let draft =
-                                edit_message(&app.compose, app.account_email.as_deref(), sig)?;
-                            if let Some((to, subject, body)) = draft {
-                                app.compose.to = to;
-                                app.compose.subject = subject;
-                                app.compose.body = body;
+                            if app.confirm_send {
+                                app.confirm_send = false;
+                                app.set_status("Send cancelled");
+                            } else {
+                                // When re-editing, don't add signature again (it's already in body)
+                                let sig = SignatureInfo {
+                                    signature: None,
+                                    delimiter: "",
+                                    include: false,
+                                };
+                                let draft =
+                                    edit_message(&app.compose, app.account_email.as_deref(), sig)?;
+                                if let Some((to, subject, body)) = draft {
+                                    app.compose.to = to;
+                                    app.compose.subject = subject;
+                                    app.compose.body = body;
+                                }
                             }
                         }
                         KeyCode::Char('a') => {
-                            if let Some(files) = pick_files()? {
+                            if app.confirm_send {
+                                app.confirm_send = false;
+                                app.set_status("Send cancelled");
+                            } else if let Some(files) = pick_files()? {
                                 for file in files {
                                     app.add_attachment(file);
                                 }
                             }
                         }
                         KeyCode::Char('d') => {
-                            app.remove_selected_attachment();
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => app.next_attachment(),
-                        KeyCode::Char('k') | KeyCode::Up => app.prev_attachment(),
-                        KeyCode::Char('s') => {
-                            if send_message(&app.compose, app.account_email.as_deref())? {
-                                app.view = View::List;
-                                app.set_status("Message sent!");
+                            if app.confirm_send {
+                                app.confirm_send = false;
+                                app.set_status("Send cancelled");
                             } else {
-                                app.set_status("Failed to send");
+                                app.remove_selected_attachment();
+                            }
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if app.confirm_send {
+                                app.confirm_send = false;
+                                app.set_status("Send cancelled");
+                            } else {
+                                app.next_attachment();
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            if app.confirm_send {
+                                app.confirm_send = false;
+                                app.set_status("Send cancelled");
+                            } else {
+                                app.prev_attachment();
+                            }
+                        }
+                        KeyCode::Char('s') => {
+                            if app.confirm_send {
+                                // Already confirming, 's' confirms the send
+                                app.confirm_send = false;
+                                if send_message(&app.compose, app.account_email.as_deref())? {
+                                    app.view = View::List;
+                                    app.set_status("Message sent!");
+                                } else {
+                                    app.set_status("Failed to send");
+                                }
+                            } else {
+                                // First press - ask for confirmation
+                                app.confirm_send = true;
+                                app.set_status(
+                                    "Press 's' again to confirm send, any other key to cancel",
+                                );
+                            }
+                        }
+                        KeyCode::Esc => {
+                            if app.confirm_send {
+                                app.confirm_send = false;
+                                app.set_status("Send cancelled");
+                            } else {
+                                app.view = View::List;
+                                app.set_status("Draft discarded");
                             }
                         }
                         _ => {}
@@ -560,7 +649,7 @@ fn render(app: &mut App, f: &mut Frame) {
             );
         }
         View::Compose => {
-            render_compose(f, chunks[0], &app.compose);
+            render_compose(f, chunks[0], &app.compose, app.confirm_send);
             render_compose_help(f, chunks[1]);
             return;
         }
@@ -646,7 +735,11 @@ fn edit_message(
     execute!(std::io::stdout(), LeaveAlternateScreen)?;
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
-    let status = Command::new(&editor).arg(&path).status()?;
+    let status = Command::new(&editor)
+        .arg("-c")
+        .arg("set wrap")
+        .arg(&path)
+        .status()?;
 
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;

@@ -60,6 +60,8 @@ pub struct App {
     pub accounts: Vec<String>,
     // Inbox filter
     pub show_unread_only: bool,
+    // Send confirmation
+    pub confirm_send: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -120,6 +122,7 @@ impl App {
             account_signature_delim,
             accounts,
             show_unread_only: false,
+            confirm_send: false,
         }
     }
 
