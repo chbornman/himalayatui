@@ -16,7 +16,8 @@ use std::process::Command;
 use app::{App, Pane, View};
 use config::Config;
 use himalaya::{
-    list_envelopes, mark_as_read, read_message, search_deep, search_notmuch, toggle_read, Envelope,
+    list_envelopes, mark_as_read, read_message, search_deep, search_envelopes, toggle_read,
+    Envelope,
 };
 use ui::{render_compose, render_compose_help, render_envelopes, render_help, render_reader};
 
@@ -479,7 +480,7 @@ fn run_search(app: &mut App) {
             app.list_state.select(Some(0));
         }
     } else {
-        match search_notmuch(&app.search_query) {
+        match search_envelopes(&app.search_query) {
             Ok(results) => {
                 app.set_search_results(results);
             }

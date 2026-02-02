@@ -8,7 +8,7 @@ A terminal email client built with [ratatui](https://github.com/ratatui-org/rata
 
 - **Two-pane layout** - Inbox list on the left, message preview on the right
 - **Vim-style navigation** - `h/l` to switch panes, `j/k` to navigate/scroll
-- **Fast search** - `/` for notmuch search (instant), `?` for ripgrep deep search
+- **Fast search** - `/` for himalaya search (live results), `?` for deep body search
 - **Compose & reply** - `c` to compose, `r` to reply, `C` to compose with attachments
 - **Attachments** - `a` to download and open in [yazi](https://github.com/sxyazi/yazi)
 - **Read/unread tracking** - Auto-marks read, `u` to toggle (syncs via mbsync)
@@ -21,9 +21,9 @@ A terminal email client built with [ratatui](https://github.com/ratatui-org/rata
 
 - [himalaya](https://github.com/pimalaya/himalaya) - Email CLI (configured with maildir backend)
 - [mbsync](https://isync.sourceforge.io/) - For syncing Gmail to local Maildir
-- [notmuch](https://notmuchmail.org/) - For fast email search
 - [w3m](http://w3m.sourceforge.net/) - For HTML email rendering
 - [yazi](https://github.com/sxyazi/yazi) - For attachment browsing (optional)
+- [ripgrep](https://github.com/BurntSushi/ripgrep) - For deep body search (optional)
 
 ## Installation
 
@@ -127,8 +127,9 @@ message.send.backend.auth.command = "pass show gmail"
 ### Actions
 | Key | Action |
 |-----|--------|
-| `/` | Search (notmuch, live results) |
-| `?` | Deep search (ripgrep, press Enter to search) |
+| `/` | Search (from/to/subject, live results) |
+| `?` | Deep search (body text, press Enter to search) |
+| `Esc` | Exit search results (return to inbox) |
 | `u` | Toggle read/unread |
 | `r` | Reply to selected message |
 | `c` | Compose new message |
@@ -150,14 +151,11 @@ This setup uses local Maildir storage synced from Gmail:
 
 ```
 Gmail <--mbsync--> ~/Mail/gmail <--himalaya--> himalayatui
-                        |
-                    notmuch (search index)
 ```
 
 1. **mbsync** syncs Gmail to local Maildir
-2. **notmuch** indexes mail for fast search  
-3. **himalaya** reads from Maildir, sends via SMTP
-4. **himalayatui** provides the TUI
+2. **himalaya** reads from Maildir, sends via SMTP, handles search
+3. **himalayatui** provides the TUI
 
 Read/unread status is stored in Maildir flags and syncs back to Gmail via mbsync.
 

@@ -126,33 +126,17 @@ fn render_html(html: &str) -> Result<String> {
 
 /// Mark a message as read (add Seen flag)
 pub fn mark_as_read(id: &str) -> Result<()> {
-    if id.parse::<u64>().is_ok() {
-        // Himalaya numeric ID
-        Command::new("himalaya")
-            .args(["flag", "add", id, "seen"])
-            .output()?;
-    } else {
-        // Notmuch maildir ID - remove unread tag
-        Command::new("notmuch")
-            .args(["tag", "-unread", &format!("id:{}", id)])
-            .output()?;
-    }
+    Command::new("himalaya")
+        .args(["flag", "add", id, "seen"])
+        .output()?;
     Ok(())
 }
 
 /// Mark a message as unread (remove Seen flag)
 pub fn mark_as_unread(id: &str) -> Result<()> {
-    if id.parse::<u64>().is_ok() {
-        // Himalaya numeric ID
-        Command::new("himalaya")
-            .args(["flag", "remove", id, "seen"])
-            .output()?;
-    } else {
-        // Notmuch maildir ID - add unread tag
-        Command::new("notmuch")
-            .args(["tag", "+unread", &format!("id:{}", id)])
-            .output()?;
-    }
+    Command::new("himalaya")
+        .args(["flag", "remove", id, "seen"])
+        .output()?;
     Ok(())
 }
 
@@ -184,104 +168,41 @@ pub fn list_folders(account: Option<&str>) -> Result<Vec<String>> {
     Ok(folders.into_iter().map(|f| f.name).collect())
 }
 
-pub fn search_notmuch(query: &str) -> Result<Vec<Envelope>> {
+/// Search envelopes using himalaya's built-in search
+/// Query syntax: "from <pattern>", "to <pattern>", "subject <pattern>", or combine with "and"/"or"
+pub fn search_envelopes(query: &str) -> Result<Vec<Envelope>> {
     if query.trim().is_empty() {
         return Ok(vec![]);
     }
 
-    // Build search query - search in from, to, subject, and body
-    // Add wildcards for prefix matching (notmuch is already case-insensitive)
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .map(|word| {
-            if word.contains(':') {
-                // Already has a field prefix, leave it alone
-                word.to_string()
-            } else {
-                // Search across multiple fields with wildcard
-                let w = word.trim_end_matches('*');
-                format!("(from:{}* or to:{}* or subject:{}* or {}*)", w, w, w, w)
-            }
-        })
-        .collect();
+    // Build himalaya search query
+    // For simple queries, search across from, to, and subject
+    let search_query = if query.contains(" and ") || query.contains(" or ") {
+        // Already a structured query
+        query.to_string()
+    } else {
+        // Simple query - search in from, to, and subject
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .map(|word| format!("(from {} or to {} or subject {})", word, word, word))
+            .collect();
+        terms.join(" and ")
+    };
 
-    let search_query = terms.join(" and ");
-
-    // Get matching files from notmuch
-    let output = Command::new("notmuch")
-        .args([
-            "search",
-            "--output=summary",
-            "--format=json",
-            "--limit=100",
-            &search_query,
-        ])
+    let output = Command::new("himalaya")
+        .args(["envelope", "list", "--output", "json", &search_query])
         .output()?;
 
-    #[derive(serde::Deserialize)]
-    struct NotmuchThread {
-        thread: String,
-        timestamp: i64,
-        date_relative: String,
-        matched: i32,
-        total: i32,
-        authors: String,
-        subject: String,
-        tags: Vec<String>,
+    if !output.status.success() {
+        return Ok(vec![]);
     }
 
-    let threads: Vec<NotmuchThread> = serde_json::from_slice(&output.stdout).unwrap_or_default();
-
-    // Convert to our Envelope format
-    // We need to get the actual message file to get the ID
-    let mut envelopes = Vec::new();
-
-    for thread in threads {
-        // Get the first message file in this thread
-        let file_output = Command::new("notmuch")
-            .args([
-                "search",
-                "--output=files",
-                "--limit=1",
-                &format!("thread:{}", thread.thread),
-            ])
-            .output()?;
-
-        let file_path = String::from_utf8_lossy(&file_output.stdout);
-        let file_path = file_path.trim();
-
-        // Extract message ID from filename (maildir format: unique_id:flags)
-        let id = std::path::Path::new(file_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.split(':').next().unwrap_or(s))
-            .unwrap_or(&thread.thread)
-            .to_string();
-
-        let flags = if thread.tags.contains(&"unread".to_string()) {
-            vec![]
-        } else {
-            vec!["Seen".to_string()]
-        };
-
-        envelopes.push(Envelope {
-            id,
-            flags,
-            subject: Some(thread.subject),
-            from: Some(super::types::Address {
-                name: Some(thread.authors.clone()),
-                addr: thread.authors,
-            }),
-            to: None,
-            date: Some(thread.date_relative),
-            has_attachment: false,
-        });
-    }
-
+    let envelopes: Vec<Envelope> = serde_json::from_slice(&output.stdout).unwrap_or_default();
     Ok(envelopes)
 }
 
-/// Deep substring search using ripgrep - slower but matches anywhere in text
+/// Deep substring search using ripgrep to find matching files,
+/// then looks up himalaya IDs by matching subjects
 pub fn search_deep(query: &str, mail_dir: &str) -> Result<Vec<Envelope>> {
     if query.trim().is_empty() {
         return Ok(vec![]);
@@ -301,61 +222,61 @@ pub fn search_deep(query: &str, mail_dir: &str) -> Result<Vec<Envelope>> {
     let files: Vec<&str> = std::str::from_utf8(&output.stdout)
         .unwrap_or("")
         .lines()
-        .take(100) // limit results
+        .take(50) // limit results for performance
         .collect();
 
-    let mut envelopes = Vec::new();
-
+    // Extract subjects from matched files
+    let mut subjects: Vec<String> = Vec::new();
     for file_path in files {
         // Skip non-mail files
         if file_path.contains(".mbsync") || file_path.contains(".stringsvalidity") {
             continue;
         }
 
-        // Parse email headers from file
         if let Ok(content) = std::fs::read_to_string(file_path) {
-            let mut from = String::new();
-            let mut subject = String::new();
-            let mut date = String::new();
-
             for line in content.lines() {
                 if line.is_empty() {
                     break; // End of headers
                 }
-                if let Some(val) = line.strip_prefix("From: ") {
-                    from = val.to_string();
-                } else if let Some(val) = line.strip_prefix("Subject: ") {
-                    subject = val.to_string();
-                } else if let Some(val) = line.strip_prefix("Date: ") {
-                    date = val.to_string();
+                if let Some(val) = line.strip_prefix("Subject: ") {
+                    // Clean subject for search (take first few words)
+                    let clean: String = val
+                        .chars()
+                        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+                        .collect();
+                    let words: Vec<&str> = clean.split_whitespace().take(4).collect();
+                    if !words.is_empty() {
+                        subjects.push(words.join(" "));
+                    }
+                    break;
                 }
             }
+        }
+    }
 
-            let id = std::path::Path::new(file_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.split(':').next().unwrap_or(s))
-                .unwrap_or("unknown")
-                .to_string();
+    // Look up each subject in himalaya to get proper IDs
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut envelopes = Vec::new();
 
-            let flags = if file_path.contains(":2,") && file_path.contains('S') {
-                vec!["Seen".to_string()]
-            } else {
-                vec![]
-            };
+    for subject in subjects.iter().take(20) {
+        // Search himalaya for this subject
+        let output = Command::new("himalaya")
+            .args([
+                "envelope",
+                "list",
+                "--output",
+                "json",
+                &format!("subject {}", subject),
+            ])
+            .output()?;
 
-            envelopes.push(Envelope {
-                id,
-                flags,
-                subject: Some(subject),
-                from: Some(super::types::Address {
-                    name: None,
-                    addr: from,
-                }),
-                to: None,
-                date: if date.is_empty() { None } else { Some(date) },
-                has_attachment: false,
-            });
+        if output.status.success() {
+            let results: Vec<Envelope> = serde_json::from_slice(&output.stdout).unwrap_or_default();
+            for env in results {
+                if seen_ids.insert(env.id.clone()) {
+                    envelopes.push(env);
+                }
+            }
         }
     }
 
