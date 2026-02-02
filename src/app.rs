@@ -58,6 +58,8 @@ pub struct App {
     pub account_signature: Option<String>,
     pub account_signature_delim: String,
     pub accounts: Vec<String>,
+    // Inbox filter
+    pub show_unread_only: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -117,6 +119,7 @@ impl App {
             account_signature,
             account_signature_delim,
             accounts,
+            show_unread_only: false,
         }
     }
 
@@ -161,11 +164,9 @@ impl App {
     pub fn refresh(&mut self, envelopes: Vec<Envelope>) {
         self.envelopes = envelopes.clone();
         self.original_envelopes = envelopes;
-        self.filtered_indices = (0..self.envelopes.len()).collect();
         self.is_search_results = false;
-        if !self.envelopes.is_empty() && self.list_state.selected().is_none() {
-            self.list_state.select(Some(0));
-        }
+        self.search_query.clear();
+        self.apply_filter();
         self.status_message = Some("Refreshed".to_string());
     }
 
@@ -218,6 +219,10 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, e)| {
+                // Apply unread filter first
+                if self.show_unread_only && e.flags.contains(&"Seen".to_string()) {
+                    return false;
+                }
                 if query.is_empty() {
                     return true;
                 }
@@ -237,6 +242,49 @@ impl App {
         }
     }
 
+    /// Toggle unread-only filter and recompute filtered_indices
+    pub fn toggle_unread_filter(&mut self) {
+        self.show_unread_only = !self.show_unread_only;
+        self.apply_filter();
+    }
+
+    /// Recompute filtered_indices based on current filters (unread + search query)
+    pub fn apply_filter(&mut self) {
+        let query = self.search_query.to_lowercase();
+        self.filtered_indices = self
+            .envelopes
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                // Apply unread filter
+                if self.show_unread_only && e.flags.contains(&"Seen".to_string()) {
+                    return false;
+                }
+                // Apply search query if any
+                if query.is_empty() {
+                    return true;
+                }
+                let subject = e.subject.as_deref().unwrap_or("").to_lowercase();
+                let from = e.from_display().to_lowercase();
+                fuzzy_match(&subject, &query) || fuzzy_match(&from, &query)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        // Preserve selection if possible, otherwise reset
+        if let Some(selected) = self.list_state.selected() {
+            if selected >= self.filtered_indices.len() {
+                if !self.filtered_indices.is_empty() {
+                    self.list_state.select(Some(0));
+                } else {
+                    self.list_state.select(None);
+                }
+            }
+        } else if !self.filtered_indices.is_empty() {
+            self.list_state.select(Some(0));
+        }
+    }
+
     pub fn confirm_search(&mut self) {
         self.view = View::List;
     }
@@ -248,22 +296,14 @@ impl App {
             self.envelopes = self.original_envelopes.clone();
             self.is_search_results = false;
         }
-        self.filtered_indices = (0..self.envelopes.len()).collect();
-        if !self.filtered_indices.is_empty() {
-            self.list_state.select(Some(0));
-        }
+        self.apply_filter();
         self.view = View::List;
     }
 
     pub fn set_search_results(&mut self, results: Vec<Envelope>) {
         self.envelopes = results;
-        self.filtered_indices = (0..self.envelopes.len()).collect();
         self.is_search_results = true;
-        if !self.envelopes.is_empty() {
-            self.list_state.select(Some(0));
-        } else {
-            self.list_state.select(None);
-        }
+        self.apply_filter();
     }
 
     pub fn scroll_down(&mut self) {

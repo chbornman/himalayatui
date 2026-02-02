@@ -118,6 +118,13 @@ fn main() -> Result<()> {
                                 });
                             }
                         }
+                        KeyCode::Char('U') => {
+                            // Toggle unread-only filter
+                            app.toggle_unread_filter();
+                            app.reload_preview(|id| {
+                                read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
+                            });
+                        }
                         KeyCode::Char('o') => {
                             if let Some(env) = app.selected_envelope() {
                                 let subject = env.subject.clone();
@@ -497,19 +504,33 @@ fn render(app: &mut App, f: &mut Frame) {
                 .as_ref()
                 .map(|a| format!("[{}] ", a))
                 .unwrap_or_default();
+            let filter_suffix = if app.show_unread_only {
+                " (Unread)"
+            } else {
+                ""
+            };
             let title = if app.is_search_results {
                 format!(
-                    "{}Search: {} ({} results)",
+                    "{}Search: {} ({} results){}",
                     account_prefix,
                     app.search_query,
-                    filtered.len()
+                    filtered.len(),
+                    filter_suffix
                 )
             } else if app.view == View::DeepSearch {
-                format!("{}Deep Search: {}", account_prefix, app.search_query)
+                format!(
+                    "{}Deep Search: {}{}",
+                    account_prefix, app.search_query, filter_suffix
+                )
             } else if app.search_query.is_empty() {
-                format!("{}Inbox", account_prefix)
+                format!("{}Inbox{}", account_prefix, filter_suffix)
             } else {
-                format!("{}Inbox ({} matches)", account_prefix, filtered.len())
+                format!(
+                    "{}Inbox ({} matches){}",
+                    account_prefix,
+                    filtered.len(),
+                    filter_suffix
+                )
             };
             render_envelopes(
                 f,
