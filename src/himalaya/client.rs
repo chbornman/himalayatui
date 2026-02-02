@@ -12,8 +12,16 @@ pub fn list_accounts() -> Result<Vec<Account>> {
     Ok(accounts)
 }
 
-/// Get email address for an account from himalaya config
-pub fn get_account_email(account_name: Option<&str>) -> Option<String> {
+/// Account info from himalaya config
+#[derive(Debug, Clone, Default)]
+pub struct AccountInfo {
+    pub email: Option<String>,
+    pub signature: Option<String>,
+    pub signature_delim: String,
+}
+
+/// Get account info (email, signature) from himalaya config
+pub fn get_account_info(account_name: Option<&str>) -> AccountInfo {
     use serde::Deserialize;
     use std::collections::HashMap;
 
@@ -25,28 +33,59 @@ pub fn get_account_email(account_name: Option<&str>) -> Option<String> {
     #[derive(Deserialize)]
     struct AccountConfig {
         email: Option<String>,
+        signature: Option<String>,
+        #[serde(rename = "signature-delim")]
+        signature_delim: Option<String>,
         #[serde(default)]
         default: bool,
     }
 
-    let config_path = dirs::config_dir()?.join("himalaya/config.toml");
-    let content = std::fs::read_to_string(&config_path).ok()?;
-    let config: HimalayaConfig = toml::from_str(&content).ok()?;
+    let default_info = AccountInfo {
+        email: None,
+        signature: None,
+        signature_delim: "-- \n".to_string(),
+    };
+
+    let config_path = match dirs::config_dir() {
+        Some(p) => p.join("himalaya/config.toml"),
+        None => return default_info,
+    };
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return default_info,
+    };
+    let config: HimalayaConfig = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(_) => return default_info,
+    };
 
     // If no account specified, find the default one
-    let email = if let Some(name) = account_name {
-        config.accounts.get(name)?.email.clone()
+    let account = if let Some(name) = account_name {
+        config.accounts.get(name)
     } else {
         config
             .accounts
             .values()
             .find(|a| a.default)
-            .or_else(|| config.accounts.values().next())?
-            .email
-            .clone()
+            .or_else(|| config.accounts.values().next())
     };
 
-    email
+    match account {
+        Some(acc) => AccountInfo {
+            email: acc.email.clone(),
+            signature: acc.signature.clone(),
+            signature_delim: acc
+                .signature_delim
+                .clone()
+                .unwrap_or_else(|| "-- \n".to_string()),
+        },
+        None => default_info,
+    }
+}
+
+/// Get email address for an account from himalaya config (convenience wrapper)
+pub fn get_account_email(account_name: Option<&str>) -> Option<String> {
+    get_account_info(account_name).email
 }
 
 /// Get default account name

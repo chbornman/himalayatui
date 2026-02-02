@@ -57,6 +57,10 @@ from_width = 18
 # Mail directory for deep search (ripgrep)
 mail_dir = "~/Mail/gmail"
 
+[compose]
+# Include signature when replying (default: true)
+signature_on_reply = true
+
 [theme]
 # Capstan Cloud - warm earth tones with gold accents (default)
 
@@ -100,8 +104,12 @@ himalayatui uses your existing himalaya configuration. Example `~/.config/himala
 [accounts.gmail]
 default = true
 email = "you@gmail.com"
+display-name = "Your Name"
+signature = "Your Name"
+signature-delim = "-- \n"
 downloads-dir = "/home/you/Downloads"
 folder.aliases.inbox = "Inbox"
+folder.aliases.sent = "[Gmail]/Sent Mail"
 backend.type = "maildir"
 backend.root-dir = "/home/you/Mail/gmail"
 
@@ -136,6 +144,7 @@ message.send.backend.auth.command = "pass show gmail"
 | `C` | Compose with attachments |
 | `a` | Download attachments & open in yazi |
 | `o` | Open in Gmail (browser) |
+| `S` | Edit himalaya config (signature, etc.) |
 | `R` | Refresh inbox |
 | `q` | Quit |
 

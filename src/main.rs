@@ -16,7 +16,7 @@ use std::process::Command;
 use app::{App, Pane, View};
 use config::Config;
 use himalaya::{
-    get_account_email, list_accounts, list_envelopes, mark_as_read, read_message, search_deep,
+    get_account_info, list_accounts, list_envelopes, mark_as_read, read_message, search_deep,
     search_envelopes, toggle_read, Envelope,
 };
 use ui::{render_compose, render_compose_help, render_envelopes, render_help, render_reader};
@@ -34,7 +34,7 @@ fn main() -> Result<()> {
         .map(|a| a.name)
         .collect();
     let account = accounts.first().cloned();
-    let account_email = get_account_email(account.as_deref());
+    let account_info = get_account_info(account.as_deref());
 
     // Setup terminal
     enable_raw_mode()?;
@@ -45,7 +45,15 @@ fn main() -> Result<()> {
 
     // Load envelopes
     let envelopes = list_envelopes(account.as_deref(), None).unwrap_or_default();
-    let mut app = App::new(envelopes, config, account, account_email, accounts);
+    let mut app = App::new(
+        envelopes,
+        config,
+        account,
+        account_info.email,
+        account_info.signature,
+        account_info.signature_delim,
+        accounts,
+    );
 
     // Load initial preview and mark as read
     load_and_mark_read(&mut app);
@@ -147,10 +155,38 @@ fn main() -> Result<()> {
                             app.preview_id = None; // Force reload
                             load_and_mark_read(&mut app);
                         }
+                        KeyCode::Char('S') => {
+                            // Edit himalaya config (for signature, etc.)
+                            if let Some(config_path) = dirs::config_dir() {
+                                let himalaya_config = config_path.join("himalaya/config.toml");
+                                if himalaya_config.exists() {
+                                    disable_raw_mode()?;
+                                    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+
+                                    let editor = std::env::var("EDITOR")
+                                        .unwrap_or_else(|_| "nvim".to_string());
+                                    let _ = Command::new(&editor).arg(&himalaya_config).status();
+
+                                    enable_raw_mode()?;
+                                    execute!(std::io::stdout(), EnterAlternateScreen)?;
+                                    terminal.clear()?;
+
+                                    // Reload account info after editing
+                                    let info = get_account_info(app.account.as_deref());
+                                    app.account_email = info.email;
+                                    app.account_signature = info.signature;
+                                    app.account_signature_delim = info.signature_delim;
+                                    app.set_status("Config reloaded");
+                                }
+                            }
+                        }
                         KeyCode::Tab => {
                             // Switch account
                             if app.next_account() {
-                                app.account_email = get_account_email(app.account.as_deref());
+                                let info = get_account_info(app.account.as_deref());
+                                app.account_email = info.email;
+                                app.account_signature = info.signature;
+                                app.account_signature_delim = info.signature_delim;
                                 let envelopes = list_envelopes(app.account.as_deref(), None)
                                     .unwrap_or_default();
                                 app.refresh(envelopes);
@@ -164,7 +200,13 @@ fn main() -> Result<()> {
                         KeyCode::Char('c') => {
                             app.start_compose(None);
                             // Open editor
-                            let draft = edit_message(&app.compose, app.account_email.as_deref())?;
+                            let sig = SignatureInfo {
+                                signature: app.account_signature.as_deref(),
+                                delimiter: &app.account_signature_delim,
+                                include: true,
+                            };
+                            let draft =
+                                edit_message(&app.compose, app.account_email.as_deref(), sig)?;
                             if let Some((to, subject, body)) = draft {
                                 app.compose.to = to;
                                 app.compose.subject = subject;
@@ -181,7 +223,13 @@ fn main() -> Result<()> {
                                 }
                             }
                             // Then open editor
-                            let draft = edit_message(&app.compose, app.account_email.as_deref())?;
+                            let sig = SignatureInfo {
+                                signature: app.account_signature.as_deref(),
+                                delimiter: &app.account_signature_delim,
+                                include: true,
+                            };
+                            let draft =
+                                edit_message(&app.compose, app.account_email.as_deref(), sig)?;
                             if let Some((to, subject, body)) = draft {
                                 app.compose.to = to;
                                 app.compose.subject = subject;
@@ -200,8 +248,13 @@ fn main() -> Result<()> {
                                     .unwrap_or_default();
                                 let subject = env.subject.clone().unwrap_or_default();
                                 app.start_compose(Some((&id, &to, &subject)));
+                                let sig = SignatureInfo {
+                                    signature: app.account_signature.as_deref(),
+                                    delimiter: &app.account_signature_delim,
+                                    include: app.config.compose.signature_on_reply,
+                                };
                                 let draft =
-                                    edit_message(&app.compose, app.account_email.as_deref())?;
+                                    edit_message(&app.compose, app.account_email.as_deref(), sig)?;
                                 if let Some((to, subject, body)) = draft {
                                     app.compose.to = to;
                                     app.compose.subject = subject;
@@ -305,7 +358,14 @@ fn main() -> Result<()> {
                             app.set_status("Draft discarded");
                         }
                         KeyCode::Char('e') => {
-                            let draft = edit_message(&app.compose, app.account_email.as_deref())?;
+                            // When re-editing, don't add signature again (it's already in body)
+                            let sig = SignatureInfo {
+                                signature: None,
+                                delimiter: "",
+                                include: false,
+                            };
+                            let draft =
+                                edit_message(&app.compose, app.account_email.as_deref(), sig)?;
                             if let Some((to, subject, body)) = draft {
                                 app.compose.to = to;
                                 app.compose.subject = subject;
@@ -526,9 +586,17 @@ fn run_search(app: &mut App) {
     }
 }
 
+/// Signature info for compose
+struct SignatureInfo<'a> {
+    signature: Option<&'a str>,
+    delimiter: &'a str,
+    include: bool,
+}
+
 fn edit_message(
     compose: &app::ComposeState,
     from_email: Option<&str>,
+    sig_info: SignatureInfo,
 ) -> Result<Option<(String, String, String)>> {
     use std::io::Write;
 
@@ -541,6 +609,13 @@ fn edit_message(
     writeln!(temp_file, "Subject: {}", compose.subject)?;
     writeln!(temp_file)?;
     write!(temp_file, "{}", compose.body)?;
+
+    // Add signature if configured
+    if sig_info.include {
+        if let Some(sig) = sig_info.signature {
+            write!(temp_file, "\n{}{}", sig_info.delimiter, sig)?;
+        }
+    }
     temp_file.flush()?;
 
     let path = temp_file.path().to_owned();

@@ -55,6 +55,8 @@ pub struct App {
     // Current account
     pub account: Option<String>,
     pub account_email: Option<String>,
+    pub account_signature: Option<String>,
+    pub account_signature_delim: String,
     pub accounts: Vec<String>,
 }
 
@@ -74,6 +76,8 @@ impl App {
         config: Arc<Config>,
         account: Option<String>,
         account_email: Option<String>,
+        account_signature: Option<String>,
+        account_signature_delim: String,
         accounts: Vec<String>,
     ) -> Self {
         let mut list_state = ListState::default();
@@ -110,6 +114,8 @@ impl App {
             pending_read_mark: None,
             account,
             account_email,
+            account_signature,
+            account_signature_delim,
             accounts,
         }
     }

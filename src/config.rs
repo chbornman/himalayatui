@@ -7,6 +7,14 @@ pub struct Config {
     pub layout: LayoutConfig,
     pub paths: PathsConfig,
     pub theme: ThemeConfig,
+    pub compose: ComposeConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct ComposeConfig {
+    /// Include signature when replying to messages
+    pub signature_on_reply: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +79,15 @@ impl Default for Config {
             layout: LayoutConfig::default(),
             paths: PathsConfig::default(),
             theme: ThemeConfig::default(),
+            compose: ComposeConfig::default(),
+        }
+    }
+}
+
+impl Default for ComposeConfig {
+    fn default() -> Self {
+        Self {
+            signature_on_reply: true,
         }
     }
 }
