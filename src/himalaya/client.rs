@@ -126,27 +126,33 @@ fn render_html(html: &str) -> Result<String> {
 
 /// Mark a message as read (add Seen flag)
 pub fn mark_as_read(id: &str) -> Result<()> {
-    // Only works with numeric IDs
-    if id.parse::<u64>().is_err() {
-        return Ok(());
+    if id.parse::<u64>().is_ok() {
+        // Himalaya numeric ID
+        Command::new("himalaya")
+            .args(["flag", "add", id, "seen"])
+            .output()?;
+    } else {
+        // Notmuch maildir ID - remove unread tag
+        Command::new("notmuch")
+            .args(["tag", "-unread", &format!("id:{}", id)])
+            .output()?;
     }
-
-    Command::new("himalaya")
-        .args(["flag", "add", id, "seen"])
-        .output()?;
     Ok(())
 }
 
 /// Mark a message as unread (remove Seen flag)
 pub fn mark_as_unread(id: &str) -> Result<()> {
-    // Only works with numeric IDs
-    if id.parse::<u64>().is_err() {
-        return Ok(());
+    if id.parse::<u64>().is_ok() {
+        // Himalaya numeric ID
+        Command::new("himalaya")
+            .args(["flag", "remove", id, "seen"])
+            .output()?;
+    } else {
+        // Notmuch maildir ID - add unread tag
+        Command::new("notmuch")
+            .args(["tag", "+unread", &format!("id:{}", id)])
+            .output()?;
     }
-
-    Command::new("himalaya")
-        .args(["flag", "remove", id, "seen"])
-        .output()?;
     Ok(())
 }
 

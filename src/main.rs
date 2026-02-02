@@ -58,7 +58,18 @@ fn main() -> Result<()> {
                 match app.view {
                     View::List => match key.code {
                         KeyCode::Char('q') => app.should_quit = true,
-                        KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
+                        KeyCode::Esc => {
+                            if app.is_search_results {
+                                app.cancel_search();
+                                app.reload_preview(|id| {
+                                    read_message(id, None)
+                                        .unwrap_or_else(|e| format!("Error: {}", e))
+                                });
+                            } else {
+                                app.focused_pane = Pane::List;
+                            }
+                        }
+                        KeyCode::Char('h') | KeyCode::Left => {
                             app.focused_pane = Pane::List;
                         }
                         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
@@ -671,8 +682,9 @@ fn load_and_mark_read(app: &mut App) {
     });
 
     // Schedule read mark if message is unread (750ms debounce)
+    // Works with both himalaya numeric IDs and notmuch maildir IDs
     if let Some(id) = id {
-        if is_unread && id.parse::<u64>().is_ok() {
+        if is_unread {
             app.schedule_read_mark(id);
         }
     }
