@@ -11,8 +11,10 @@ A terminal email client built with [ratatui](https://github.com/ratatui-org/rata
 - **Fast search** - `/` for notmuch search (instant), `?` for ripgrep deep search
 - **Compose & reply** - `c` to compose, `r` to reply, `C` to compose with attachments
 - **Attachments** - `a` to download and open in [yazi](https://github.com/sxyazi/yazi)
+- **Read/unread tracking** - Auto-marks read, `u` to toggle (syncs via mbsync)
 - **Mouse support** - Click to select, scroll wheel, clickable URLs
 - **HTML rendering** - Rendered to text via w3m
+- **Configurable theming** - Semantic color system with Capstan Cloud defaults
 - **Dynamic layout** - Panes resize based on focus
 
 ## Requirements
@@ -36,6 +38,61 @@ cp target/release/himalayatui ~/.local/bin/
 ```
 
 ## Configuration
+
+### himalayatui config
+
+Create `~/.config/himalayatui/config.toml`:
+
+```toml
+[layout]
+# Pane width percentages when focused
+list_focused_width = 66
+preview_focused_width = 67
+
+# Column widths in characters
+date_width = 14
+from_width = 18
+
+[paths]
+# Mail directory for deep search (ripgrep)
+mail_dir = "~/Mail/gmail"
+
+[theme]
+# Capstan Cloud - warm earth tones with gold accents (default)
+
+# Base colors
+bg = "#1a1917"
+bg_panel = "#262422"
+bg_element = "#393634"
+fg = "#f7f7f5"
+fg_muted = "#8c8985"
+fg_subtle = "#b8b5b0"
+
+# Border colors
+border = "#524f4c"
+border_subtle = "#393634"
+border_active = "#d4a366"
+
+# Accent colors
+primary = "#d4a366"
+primary_light = "#f8ce9b"
+secondary = "#8fa5ae"
+secondary_light = "#b3c5cc"
+
+# Semantic colors
+success = "#52c41a"
+warning = "#faad14"
+error = "#ff4d4f"
+info = "#88c0d0"
+
+# UI-specific
+selected_bg = "#393634"
+unread = "#d4a366"
+url = "#8fa5ae"
+attachment = "#b48ead"
+```
+
+### himalaya config
 
 himalayatui uses your existing himalaya configuration. Example `~/.config/himalaya/config.toml`:
 
@@ -72,6 +129,7 @@ message.send.backend.auth.command = "pass show gmail"
 |-----|--------|
 | `/` | Search (notmuch, live results) |
 | `?` | Deep search (ripgrep, press Enter to search) |
+| `u` | Toggle read/unread |
 | `r` | Reply to selected message |
 | `c` | Compose new message |
 | `C` | Compose with attachments |
@@ -100,6 +158,8 @@ Gmail <--mbsync--> ~/Mail/gmail <--himalaya--> himalayatui
 2. **notmuch** indexes mail for fast search  
 3. **himalaya** reads from Maildir, sends via SMTP
 4. **himalayatui** provides the TUI
+
+Read/unread status is stored in Maildir flags and syncs back to Gmail via mbsync.
 
 ## License
 

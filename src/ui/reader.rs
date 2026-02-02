@@ -1,10 +1,12 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
+
+use crate::config::ThemeConfig;
 
 /// Extract URLs from content - returns (row, col_start, col_end, url)
 pub fn extract_urls(content: &str) -> Vec<(u16, u16, u16, String)> {
@@ -40,10 +42,11 @@ pub fn extract_urls(content: &str) -> Vec<(u16, u16, u16, String)> {
 }
 
 /// Style content with underlined URLs
-fn style_content(content: &str) -> Vec<Line<'static>> {
+fn style_content(content: &str, theme: &ThemeConfig) -> Vec<Line<'static>> {
     let url_style = Style::default()
-        .fg(Color::Blue)
+        .fg(theme.url())
         .add_modifier(Modifier::UNDERLINED);
+    let text_style = Style::default().fg(theme.fg());
 
     content
         .lines()
@@ -65,7 +68,10 @@ fn style_content(content: &str) -> Vec<Line<'static>> {
                     .unwrap_or(line_str.len());
 
                 if abs_start > last_end {
-                    spans.push(Span::raw(line_str[last_end..abs_start].to_string()));
+                    spans.push(Span::styled(
+                        line_str[last_end..abs_start].to_string(),
+                        text_style,
+                    ));
                 }
                 spans.push(Span::styled(
                     line_str[abs_start..url_end].to_string(),
@@ -77,10 +83,10 @@ fn style_content(content: &str) -> Vec<Line<'static>> {
             }
 
             if last_end < line_str.len() {
-                spans.push(Span::raw(line_str[last_end..].to_string()));
+                spans.push(Span::styled(line_str[last_end..].to_string(), text_style));
             }
             if spans.is_empty() {
-                spans.push(Span::raw(line_str.to_string()));
+                spans.push(Span::styled(line_str.to_string(), text_style));
             }
 
             Line::from(spans)
@@ -95,20 +101,22 @@ pub fn render_reader(
     scroll: u16,
     focused: bool,
     title: &str,
+    theme: &ThemeConfig,
 ) {
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
+    let border_color = if focused {
+        theme.border_active()
     } else {
-        Style::default().fg(Color::DarkGray)
+        theme.border_subtle()
     };
 
-    let lines = style_content(content);
+    let lines = style_content(content, theme);
 
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(border_style)
+                .border_style(Style::default().fg(border_color))
+                .title_style(Style::default().fg(theme.primary()))
                 .title(title),
         )
         .wrap(Wrap { trim: false })

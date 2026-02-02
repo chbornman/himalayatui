@@ -1,5 +1,8 @@
 use ratatui::{layout::Rect, widgets::ListState};
+use std::sync::Arc;
+use std::time::Instant;
 
+use crate::config::Config;
 use crate::himalaya::Envelope;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -19,6 +22,7 @@ pub enum Pane {
 }
 
 pub struct App {
+    pub config: Arc<Config>,
     pub view: View,
     pub envelopes: Vec<Envelope>,
     pub original_envelopes: Vec<Envelope>, // Store original list for cancel
@@ -46,6 +50,8 @@ pub struct App {
     pub preview_area: Rect,
     // Clickable URLs in preview: (row, col_start, col_end, url)
     pub preview_urls: Vec<(u16, u16, u16, String)>,
+    // Debounced read marking: (message_id, opened_at)
+    pub pending_read_mark: Option<(String, Instant)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -59,7 +65,7 @@ pub struct ComposeState {
 }
 
 impl App {
-    pub fn new(envelopes: Vec<Envelope>) -> Self {
+    pub fn new(envelopes: Vec<Envelope>, config: Arc<Config>) -> Self {
         let mut list_state = ListState::default();
         if !envelopes.is_empty() {
             list_state.select(Some(0));
@@ -68,6 +74,7 @@ impl App {
         let filtered_indices: Vec<usize> = (0..envelopes.len()).collect();
 
         Self {
+            config,
             view: View::List,
             original_envelopes: envelopes.clone(),
             envelopes,
@@ -90,7 +97,31 @@ impl App {
             list_area: Rect::default(),
             preview_area: Rect::default(),
             preview_urls: Vec::new(),
+            pending_read_mark: None,
         }
+    }
+
+    /// Schedule a message to be marked as read after delay
+    pub fn schedule_read_mark(&mut self, id: String) {
+        self.pending_read_mark = Some((id, Instant::now()));
+    }
+
+    /// Check if pending read mark is ready (750ms elapsed)
+    /// Returns the message ID if ready to mark
+    pub fn check_pending_read_mark(&mut self) -> Option<String> {
+        if let Some((ref id, opened_at)) = self.pending_read_mark {
+            if opened_at.elapsed().as_millis() >= 750 {
+                let id = id.clone();
+                self.pending_read_mark = None;
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Cancel pending read mark (e.g., when navigating away quickly)
+    pub fn cancel_pending_read_mark(&mut self) {
+        self.pending_read_mark = None;
     }
 
     pub fn refresh(&mut self, envelopes: Vec<Envelope>) {
@@ -242,6 +273,38 @@ impl App {
         self.load_preview_if_needed(loader);
     }
 
+    /// Mark current email as read in local state
+    pub fn mark_current_read(&mut self) {
+        if let Some(selected) = self.list_state.selected() {
+            if let Some(&idx) = self.filtered_indices.get(selected) {
+                if let Some(env) = self.envelopes.get_mut(idx) {
+                    if !env.flags.contains(&"Seen".to_string()) {
+                        env.flags.push("Seen".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Toggle read/unread status in local state, returns (id, is_now_read)
+    pub fn toggle_current_read(&mut self) -> Option<(String, bool)> {
+        if let Some(selected) = self.list_state.selected() {
+            if let Some(&idx) = self.filtered_indices.get(selected) {
+                if let Some(env) = self.envelopes.get_mut(idx) {
+                    let id = env.id.clone();
+                    if env.flags.contains(&"Seen".to_string()) {
+                        env.flags.retain(|f| f != "Seen");
+                        return Some((id, false));
+                    } else {
+                        env.flags.push("Seen".to_string());
+                        return Some((id, true));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Update pane areas (called during render)
     pub fn set_pane_areas(&mut self, list: Rect, preview: Rect) {
         self.list_area = list;
@@ -257,11 +320,11 @@ impl App {
             && y < self.list_area.y + self.list_area.height
         {
             self.focused_pane = Pane::List;
-            // Calculate which row was clicked (accounting for border)
-            let row = y.saturating_sub(self.list_area.y + 1); // +1 for top border
-            let row = row as usize;
-            if row < self.filtered_indices.len() {
-                self.list_state.select(Some(row));
+            // Calculate which row was clicked (accounting for border and scroll offset)
+            let visual_row = y.saturating_sub(self.list_area.y + 1) as usize; // +1 for top border
+            let actual_row = visual_row + self.list_state.offset();
+            if actual_row < self.filtered_indices.len() {
+                self.list_state.select(Some(actual_row));
                 return true;
             }
         }

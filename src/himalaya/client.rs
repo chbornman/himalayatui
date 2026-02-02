@@ -124,6 +124,41 @@ fn render_html(html: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Mark a message as read (add Seen flag)
+pub fn mark_as_read(id: &str) -> Result<()> {
+    // Only works with numeric IDs
+    if id.parse::<u64>().is_err() {
+        return Ok(());
+    }
+
+    Command::new("himalaya")
+        .args(["flag", "add", id, "seen"])
+        .output()?;
+    Ok(())
+}
+
+/// Mark a message as unread (remove Seen flag)
+pub fn mark_as_unread(id: &str) -> Result<()> {
+    // Only works with numeric IDs
+    if id.parse::<u64>().is_err() {
+        return Ok(());
+    }
+
+    Command::new("himalaya")
+        .args(["flag", "remove", id, "seen"])
+        .output()?;
+    Ok(())
+}
+
+/// Toggle read/unread status
+pub fn toggle_read(id: &str, currently_read: bool) -> Result<()> {
+    if currently_read {
+        mark_as_unread(id)
+    } else {
+        mark_as_read(id)
+    }
+}
+
 pub fn list_folders(account: Option<&str>) -> Result<Vec<String>> {
     let mut cmd = Command::new("himalaya");
     cmd.args(["folder", "list", "--output", "json"]);

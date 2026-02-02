@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod himalaya;
 mod ui;
 
@@ -13,10 +14,18 @@ use std::io;
 use std::process::Command;
 
 use app::{App, Pane, View};
-use himalaya::{list_envelopes, read_message, search_deep, search_notmuch};
+use config::Config;
+use himalaya::{
+    list_envelopes, mark_as_read, read_message, search_deep, search_notmuch, toggle_read, Envelope,
+};
 use ui::{render_compose, render_compose_help, render_envelopes, render_help, render_reader};
 
+use std::sync::Arc;
+
 fn main() -> Result<()> {
+    // Load config
+    let config = Arc::new(Config::load());
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -26,16 +35,17 @@ fn main() -> Result<()> {
 
     // Load envelopes
     let envelopes = list_envelopes(None, None).unwrap_or_default();
-    let mut app = App::new(envelopes);
+    let mut app = App::new(envelopes, config);
 
-    // Load initial preview
-    app.load_preview_if_needed(|id| {
-        read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-    });
+    // Load initial preview and mark as read
+    load_and_mark_read(&mut app);
 
     // Main loop
     loop {
         terminal.draw(|f| render(&mut app, f))?;
+
+        // Process any pending debounced read marks
+        process_pending_read_marks(&mut app);
 
         // Poll with timeout so we redraw on resize even without focus
         if !event::poll(std::time::Duration::from_millis(100))? {
@@ -57,23 +67,28 @@ fn main() -> Result<()> {
                         KeyCode::Char('j') | KeyCode::Down => match app.focused_pane {
                             Pane::List => {
                                 app.next();
-                                app.load_preview_if_needed(|id| {
-                                    read_message(id, None)
-                                        .unwrap_or_else(|e| format!("Error: {}", e))
-                                });
+                                load_and_mark_read(&mut app);
                             }
                             Pane::Preview => app.preview_scroll_down(),
                         },
                         KeyCode::Char('k') | KeyCode::Up => match app.focused_pane {
                             Pane::List => {
                                 app.previous();
-                                app.load_preview_if_needed(|id| {
-                                    read_message(id, None)
-                                        .unwrap_or_else(|e| format!("Error: {}", e))
-                                });
+                                load_and_mark_read(&mut app);
                             }
                             Pane::Preview => app.preview_scroll_up(),
                         },
+                        KeyCode::Char('u') => {
+                            // Toggle read/unread
+                            if let Some((id, is_read)) = app.toggle_current_read() {
+                                let _ = toggle_read(&id, !is_read);
+                                app.set_status(if is_read {
+                                    "Marked read"
+                                } else {
+                                    "Marked unread"
+                                });
+                            }
+                        }
                         KeyCode::Char('o') => {
                             if let Some(env) = app.selected_envelope() {
                                 let subject = env.subject.clone();
@@ -107,9 +122,8 @@ fn main() -> Result<()> {
                         KeyCode::Char('R') => {
                             let envelopes = list_envelopes(None, None).unwrap_or_default();
                             app.refresh(envelopes);
-                            app.reload_preview(|id| {
-                                read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
-                            });
+                            app.preview_id = None; // Force reload
+                            load_and_mark_read(&mut app);
                         }
                         KeyCode::Char('c') => {
                             app.start_compose(None);
@@ -339,6 +353,8 @@ fn main() -> Result<()> {
 
 fn render(app: &mut App, f: &mut Frame) {
     let area = f.area();
+    let config = app.config.clone();
+    let theme = &config.theme;
 
     // Split into main area and help bar
     let chunks = Layout::default()
@@ -351,8 +367,14 @@ fn render(app: &mut App, f: &mut Frame) {
             // Two-pane layout: list on left, preview on right
             // Size depends on which pane is focused
             let (list_pct, preview_pct) = match app.focused_pane {
-                Pane::List => (66, 34),
-                Pane::Preview => (33, 67),
+                Pane::List => (
+                    config.layout.list_focused_width,
+                    100 - config.layout.list_focused_width,
+                ),
+                Pane::Preview => (
+                    100 - config.layout.preview_focused_width,
+                    config.layout.preview_focused_width,
+                ),
             };
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
@@ -366,8 +388,13 @@ fn render(app: &mut App, f: &mut Frame) {
             app.set_pane_areas(panes[0], panes[1]);
 
             // Left pane: envelope list
-            let filtered = app.filtered_envelopes();
-            let mut state = app.list_state.clone();
+            // Clone filtered envelopes to avoid borrow conflict with list_state
+            let filtered: Vec<Envelope> = app
+                .filtered_indices
+                .iter()
+                .filter_map(|&i| app.envelopes.get(i).cloned())
+                .collect();
+            let filtered_refs: Vec<&Envelope> = filtered.iter().collect();
             let title = if app.is_search_results {
                 format!("Search: {} ({} results)", app.search_query, filtered.len())
             } else if app.view == View::DeepSearch {
@@ -380,10 +407,13 @@ fn render(app: &mut App, f: &mut Frame) {
             render_envelopes(
                 f,
                 panes[0],
-                &filtered,
-                &mut state,
+                &filtered_refs,
+                &mut app.list_state,
                 &title,
                 app.focused_pane == Pane::List,
+                theme,
+                config.layout.date_width,
+                config.layout.from_width,
             );
 
             // Right pane: message preview with clickable URLs
@@ -398,6 +428,7 @@ fn render(app: &mut App, f: &mut Frame) {
                 app.preview_scroll,
                 app.focused_pane == Pane::Preview,
                 &preview_title,
+                theme,
             );
         }
         View::Compose => {
@@ -423,6 +454,7 @@ fn render(app: &mut App, f: &mut Frame) {
         app.view,
         app.status_message.as_deref(),
         search_query,
+        theme,
     );
 }
 
@@ -620,4 +652,36 @@ fn open_yazi(path: &str, terminal: &mut Terminal<CrosstermBackend<std::io::Stdou
     execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     terminal.clear()?;
     Ok(())
+}
+
+/// Load preview for current selection and schedule read mark (debounced)
+fn load_and_mark_read(app: &mut App) {
+    // Cancel any pending read mark from previous selection
+    app.cancel_pending_read_mark();
+
+    // Get ID before loading
+    let id = app.selected_envelope().map(|e| e.id.clone());
+    let is_unread = app
+        .selected_envelope()
+        .map(|e| !e.flags.contains(&"Seen".to_string()))
+        .unwrap_or(false);
+
+    app.load_preview_if_needed(|id| {
+        read_message(id, None).unwrap_or_else(|e| format!("Error: {}", e))
+    });
+
+    // Schedule read mark if message is unread (750ms debounce)
+    if let Some(id) = id {
+        if is_unread && id.parse::<u64>().is_ok() {
+            app.schedule_read_mark(id);
+        }
+    }
+}
+
+/// Process pending read marks (call in main loop)
+fn process_pending_read_marks(app: &mut App) {
+    if let Some(id) = app.check_pending_read_mark() {
+        let _ = mark_as_read(&id);
+        app.mark_current_read();
+    }
 }

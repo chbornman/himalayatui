@@ -1,12 +1,13 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
 
 use crate::app::View;
+use crate::config::ThemeConfig;
 
 pub fn render_help(
     f: &mut Frame,
@@ -14,69 +15,73 @@ pub fn render_help(
     view: View,
     status: Option<&str>,
     search_query: Option<&str>,
+    theme: &ThemeConfig,
 ) {
+    let key_style = Style::default().fg(theme.primary());
+    let text_style = Style::default().fg(theme.fg_subtle());
+    let search_style = Style::default().fg(theme.fg());
+    let cursor_style = Style::default().fg(theme.primary());
+    let deep_key_style = Style::default().fg(theme.secondary());
+    let muted_style = Style::default().fg(theme.fg_muted());
+
     let help_text = match view {
         View::Search => vec![
-            Span::styled("/", Style::default().fg(Color::Yellow)),
+            Span::styled("/", key_style),
             Span::raw(" "),
-            Span::styled(
-                search_query.unwrap_or(""),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled("_", Style::default().fg(Color::Yellow)),
-            Span::raw("  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(" confirm  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
-            Span::raw(" cancel"),
+            Span::styled(search_query.unwrap_or(""), search_style),
+            Span::styled("_", cursor_style),
+            Span::styled("  ", text_style),
+            Span::styled("Enter", key_style),
+            Span::styled(" confirm  ", text_style),
+            Span::styled("Esc", key_style),
+            Span::styled(" cancel", text_style),
         ],
         View::List => vec![
-            Span::styled("h/l", Style::default().fg(Color::Yellow)),
-            Span::raw(" pane  "),
-            Span::styled("j/k", Style::default().fg(Color::Yellow)),
-            Span::raw(" nav  "),
-            Span::styled("/", Style::default().fg(Color::Yellow)),
-            Span::raw(" search  "),
-            Span::styled("?", Style::default().fg(Color::Yellow)),
-            Span::raw(" deep  "),
-            Span::styled("r", Style::default().fg(Color::Yellow)),
-            Span::raw(" reply  "),
-            Span::styled("a", Style::default().fg(Color::Yellow)),
-            Span::raw(" attach  "),
-            Span::styled("o", Style::default().fg(Color::Yellow)),
-            Span::raw(" browser  "),
-            Span::styled("c", Style::default().fg(Color::Yellow)),
-            Span::raw(" compose  "),
-            Span::styled("R", Style::default().fg(Color::Yellow)),
-            Span::raw(" refresh  "),
-            Span::styled("q", Style::default().fg(Color::Yellow)),
-            Span::raw(" quit"),
+            Span::styled("h/l", key_style),
+            Span::styled(" pane  ", text_style),
+            Span::styled("j/k", key_style),
+            Span::styled(" nav  ", text_style),
+            Span::styled("u", key_style),
+            Span::styled(" unread  ", text_style),
+            Span::styled("/", key_style),
+            Span::styled(" search  ", text_style),
+            Span::styled("?", key_style),
+            Span::styled(" deep  ", text_style),
+            Span::styled("r", key_style),
+            Span::styled(" reply  ", text_style),
+            Span::styled("a", key_style),
+            Span::styled(" attach  ", text_style),
+            Span::styled("o", key_style),
+            Span::styled(" browser  ", text_style),
+            Span::styled("c", key_style),
+            Span::styled(" compose  ", text_style),
+            Span::styled("R", key_style),
+            Span::styled(" refresh  ", text_style),
+            Span::styled("q", key_style),
+            Span::styled(" quit", text_style),
         ],
         View::Reader => vec![
-            Span::styled("j/k", Style::default().fg(Color::Yellow)),
-            Span::raw(" scroll  "),
-            Span::styled("r", Style::default().fg(Color::Yellow)),
-            Span::raw(" reply  "),
-            Span::styled("o", Style::default().fg(Color::Yellow)),
-            Span::raw(" browser  "),
-            Span::styled("q/Esc", Style::default().fg(Color::Yellow)),
-            Span::raw(" back"),
+            Span::styled("j/k", key_style),
+            Span::styled(" scroll  ", text_style),
+            Span::styled("r", key_style),
+            Span::styled(" reply  ", text_style),
+            Span::styled("o", key_style),
+            Span::styled(" browser  ", text_style),
+            Span::styled("q/Esc", key_style),
+            Span::styled(" back", text_style),
         ],
-        View::Loading => vec![Span::raw("Loading...")],
+        View::Loading => vec![Span::styled("Loading...", text_style)],
         View::DeepSearch => vec![
-            Span::styled("?", Style::default().fg(Color::Magenta)),
+            Span::styled("?", deep_key_style),
             Span::raw(" "),
-            Span::styled(
-                search_query.unwrap_or(""),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled("_", Style::default().fg(Color::Magenta)),
-            Span::raw("  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
-            Span::raw(" search  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
-            Span::raw(" cancel  "),
-            Span::styled("(substring match)", Style::default().fg(Color::DarkGray)),
+            Span::styled(search_query.unwrap_or(""), search_style),
+            Span::styled("_", deep_key_style),
+            Span::styled("  ", text_style),
+            Span::styled("Enter", key_style),
+            Span::styled(" search  ", text_style),
+            Span::styled("Esc", key_style),
+            Span::styled(" cancel  ", text_style),
+            Span::styled("(substring match)", muted_style),
         ],
         View::Compose => vec![], // Compose has its own help bar
     };
@@ -85,12 +90,13 @@ pub fn render_help(
 
     // Add status message if present
     if let Some(msg) = status {
-        line.spans.push(Span::raw("  │  "));
         line.spans
-            .push(Span::styled(msg, Style::default().fg(Color::Green)));
+            .push(Span::styled("  │  ", Style::default().fg(theme.border())));
+        line.spans
+            .push(Span::styled(msg, Style::default().fg(theme.success())));
     }
 
-    let paragraph = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
+    let paragraph = Paragraph::new(line).style(Style::default().bg(theme.bg_panel()));
 
     f.render_widget(paragraph, area);
 }

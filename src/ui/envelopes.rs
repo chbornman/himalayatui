@@ -1,11 +1,12 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
-    text::Line,
+    style::{Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
 };
 
+use crate::config::ThemeConfig;
 use crate::himalaya::Envelope;
 
 pub fn render_envelopes(
@@ -15,63 +16,94 @@ pub fn render_envelopes(
     state: &mut ListState,
     title: &str,
     focused: bool,
+    theme: &ThemeConfig,
+    date_width: usize,
+    from_width: usize,
 ) {
     // Available width: area minus borders (2) minus highlight symbol (2)
     let avail_width = area.width.saturating_sub(4) as usize;
-
-    // Fixed widths: flags (2) + spacing
-    // Date: "Feb 02 04:11" = 12 chars
-    // From: flexible
-    // Subject: rest
-    let date_width = 14; // "Feb 02 04:11" + padding
-    let from_width = 18.min(avail_width.saturating_sub(date_width + 4) / 3);
-    let subject_width = avail_width.saturating_sub(date_width + from_width + 4);
+    let from_w = from_width.min(avail_width.saturating_sub(date_width + 4) / 3);
+    let subject_width = avail_width.saturating_sub(date_width + from_w + 4);
 
     let items: Vec<ListItem> = envelopes
         .iter()
         .map(|e| {
-            let unread = if e.flags.contains(&"Seen".to_string()) {
-                " "
-            } else {
-                "*"
-            };
-            let attach = if e.has_attachment { "@" } else { " " };
+            let is_unread = !e.flags.contains(&"Seen".to_string());
+            let has_attach = e.has_attachment;
+
+            let unread_marker = if is_unread { "*" } else { " " };
+            let attach_marker = if has_attach { "@" } else { " " };
             let from = e.from_display();
             let subject = e.subject.as_deref().unwrap_or("(no subject)");
             let date = format_date(e.date.as_deref().unwrap_or(""));
-            let line = format!(
-                "{}{} {:dw$} {:fw$} {}",
-                unread,
-                attach,
+
+            // Build styled spans
+            let mut spans = vec![];
+
+            // Unread marker with color
+            if is_unread {
+                spans.push(Span::styled(
+                    unread_marker,
+                    Style::default().fg(theme.unread()),
+                ));
+            } else {
+                spans.push(Span::raw(unread_marker));
+            }
+
+            // Attachment marker with color
+            if has_attach {
+                spans.push(Span::styled(
+                    attach_marker,
+                    Style::default().fg(theme.attachment()),
+                ));
+            } else {
+                spans.push(Span::raw(attach_marker));
+            }
+
+            // Rest of line
+            let rest = format!(
+                " {:dw$} {:fw$} {}",
                 truncate(&date, date_width),
-                truncate(&from, from_width),
+                truncate(&from, from_w),
                 truncate(subject, subject_width),
                 dw = date_width,
-                fw = from_width,
+                fw = from_w,
             );
-            ListItem::new(Line::raw(line))
+
+            if is_unread {
+                spans.push(Span::styled(
+                    rest,
+                    Style::default().fg(theme.fg()).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(rest, Style::default().fg(theme.fg_muted())));
+            }
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
+    let border_color = if focused {
+        theme.border_active()
     } else {
-        Style::default().fg(Color::DarkGray)
+        theme.border_subtle()
     };
 
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(border_style)
+                .border_style(Style::default().fg(border_color))
+                .title_style(Style::default().fg(theme.primary()))
                 .title(title.to_string()),
         )
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(theme.selected_bg())
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("> ");
+        .highlight_symbol("> ")
+        .scroll_padding(0);
 
     f.render_stateful_widget(list, area, state);
 }
